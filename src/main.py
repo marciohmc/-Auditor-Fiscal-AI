@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Dict, Any, List
 
 from fastapi import FastAPI, Request, Response, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
@@ -21,6 +21,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://bot-financeiro-telegram-daqm.onrender.com")
 
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
@@ -39,7 +40,7 @@ def get_sheets_client():
         "https://www.googleapis.com/auth/drive"
     ]
     if not GOOGLE_CREDENTIALS_JSON:
-        raise ValueError("GOOGLE_CREDENTIALS_JSON não configurada nas variáveis de ambiente.")
+        raise ValueError("Variável GOOGLE_CREDENTIALS_JSON não configurada.")
     cred_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     credentials = Credentials.from_service_account_info(cred_dict, scopes=scopes)
     return gspread.authorize(credentials)
@@ -63,6 +64,8 @@ def send_telegram_message(chat_id: int, text: str, reply_to_message_id: int = No
 
 def download_telegram_file(file_id: str) -> bytes:
     res_path = requests.get(f"{TELEGRAM_API_BASE}/getFile", params={"file_id": file_id}, timeout=10).json()
+    if not res_path.get("ok"):
+        raise RuntimeError(f"Erro Telegram getFile: {res_path.get('description', 'Arquivo não encontrado')}")
     file_path = res_path["result"]["file_path"]
     download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
     file_res = requests.get(download_url, timeout=30)
@@ -125,7 +128,7 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
 
 def append_to_sheet(data: Dict[str, Any]) -> int:
     if not SPREADSHEET_ID:
-        raise ValueError("SPREADSHEET_ID não configurada nas variáveis de ambiente.")
+        raise ValueError("Variável SPREADSHEET_ID não configurada.")
     
     gc = get_sheets_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -139,8 +142,149 @@ def append_to_sheet(data: Dict[str, Any]) -> int:
         str(data.get("pagamento", "Não Informado")),
         float(data.get("valor", 0.0))
     ]
-    res = worksheet.append_row(row)
+    worksheet.append_row(row)
     return len(worksheet.get_all_values())
+
+def run_prerequisites_diagnostics(host_url: str) -> Dict[str, Any]:
+    target_webhook_url = f"{host_url.rstrip('/')}/webhook"
+    
+    results = {
+        "telegram_token": {"ok": False, "msg": "", "detail": ""},
+        "telegram_webhook": {"ok": False, "msg": "", "detail": "", "current_url": ""},
+        "gemini_api": {"ok": False, "msg": "", "detail": ""},
+        "google_sheets": {"ok": False, "msg": "", "detail": "", "client_email": ""},
+    }
+
+    if not TELEGRAM_BOT_TOKEN:
+        results["telegram_token"]["ok"] = False
+        results["telegram_token"]["msg"] = "Variável TELEGRAM_BOT_TOKEN ausente"
+        results["telegram_token"]["detail"] = "Configure a variável TELEGRAM_BOT_TOKEN no painel Environment do Render."
+    else:
+        try:
+            r = requests.get(f"{TELEGRAM_API_BASE}/getMe", timeout=6)
+            res = r.json()
+            if res.get("ok"):
+                bot_user = res["result"].get("username", "Desconhecido")
+                bot_name = res["result"].get("first_name", "Bot")
+                results["telegram_token"]["ok"] = True
+                results["telegram_token"]["msg"] = f"Token Válido (@{bot_user} - {bot_name})"
+                results["telegram_token"]["detail"] = f"Conexão autenticada com sucesso na API do Telegram (ID: {res['result'].get('id')})."
+            else:
+                results["telegram_token"]["ok"] = False
+                results["telegram_token"]["msg"] = f"Token Inválido ({res.get('description')})"
+                results["telegram_token"]["detail"] = "Verifique o token copiado do @BotFather no Telegram."
+        except Exception as e:
+            results["telegram_token"]["ok"] = False
+            results["telegram_token"]["msg"] = "Erro de conexão com api.telegram.org"
+            results["telegram_token"]["detail"] = str(e)
+
+    if results["telegram_token"]["ok"]:
+        try:
+            r_wh = requests.get(f"{TELEGRAM_API_BASE}/getWebhookInfo", timeout=6)
+            wh_info = r_wh.json().get("result", {})
+            registered_url = wh_info.get("url", "")
+            results["telegram_webhook"]["current_url"] = registered_url or "Nenhum webhook registrado"
+
+            if registered_url == target_webhook_url:
+                pending = wh_info.get("pending_update_count", 0)
+                results["telegram_webhook"]["ok"] = True
+                results["telegram_webhook"]["msg"] = "Webhook Registrado Corretamente"
+                results["telegram_webhook"]["detail"] = f"URL configurada: {registered_url} | Mensagens pendentes: {pending}"
+            elif registered_url:
+                results["telegram_webhook"]["ok"] = False
+                results["telegram_webhook"]["msg"] = "URL do Webhook Diferente"
+                results["telegram_webhook"]["detail"] = f"URL registrada no Telegram: '{registered_url}'. O esperado é '{target_webhook_url}'. Clique no botão abaixo para corrigir."
+            else:
+                results["telegram_webhook"]["ok"] = False
+                results["telegram_webhook"]["msg"] = "Webhook Não Registrado no Telegram"
+                results["telegram_webhook"]["detail"] = f"O Telegram ainda não sabe para onde enviar as fotos. Clique no botão 'Registrar Webhook Automaticamente' abaixo."
+        except Exception as e:
+            results["telegram_webhook"]["ok"] = False
+            results["telegram_webhook"]["msg"] = "Erro ao checar Webhook"
+            results["telegram_webhook"]["detail"] = str(e)
+    else:
+        results["telegram_webhook"]["ok"] = False
+        results["telegram_webhook"]["msg"] = "Não verificado (Token inválido)"
+        results["telegram_webhook"]["detail"] = "Corrija o token do Telegram primeiro."
+
+    if not GEMINI_API_KEY:
+        results["gemini_api"]["ok"] = False
+        results["gemini_api"]["msg"] = "Variável GEMINI_API_KEY ausente"
+        results["gemini_api"]["detail"] = "Adicione a chave GEMINI_API_KEY nas variáveis de ambiente do Render."
+    else:
+        try:
+            test_resp = genai_client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents="responda estritamente 'OK'",
+                config=types.GenerateContentConfig(response_mime_type="text/plain")
+            )
+            txt = (test_resp.text or "").strip()
+            results["gemini_api"]["ok"] = True
+            results["gemini_api"]["msg"] = "API Conectada & Operacional"
+            results["gemini_api"]["detail"] = f"Modelo gemini-3.8-flash respondeu com sucesso: '{txt}'"
+        except Exception as e_gem:
+            results["gemini_api"]["ok"] = False
+            results["gemini_api"]["msg"] = "Falha na chamada Gemini API"
+            results["gemini_api"]["detail"] = f"Erro retornado: {str(e_gem)}. Verifique cotas ou permissões da chave."
+
+    client_email = ""
+    if not GOOGLE_CREDENTIALS_JSON:
+        results["google_sheets"]["ok"] = False
+        results["google_sheets"]["msg"] = "Variável GOOGLE_CREDENTIALS_JSON ausente"
+        results["google_sheets"]["detail"] = "Cole o JSON da conta de serviço (Service Account) na variável GOOGLE_CREDENTIALS_JSON."
+    elif not SPREADSHEET_ID:
+        results["google_sheets"]["ok"] = False
+        results["google_sheets"]["msg"] = "Variável SPREADSHEET_ID ausente"
+        results["google_sheets"]["detail"] = "Configure o ID da planilha (código entre /d/ e /edit na URL da planilha)."
+    else:
+        try:
+            cred_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+            client_email = cred_dict.get("client_email", "")
+            results["google_sheets"]["client_email"] = client_email
+
+            gc = get_sheets_client()
+            sh = gc.open_by_key(SPREADSHEET_ID)
+            ws = sh.get_worksheet(0)
+            sheet_title = sh.title
+            row_count = len(ws.get_all_values())
+
+            results["google_sheets"]["ok"] = True
+            results["google_sheets"]["msg"] = f"Conectado: '{sheet_title}'"
+            results["google_sheets"]["detail"] = f"Aba 0 ativa com {row_count} linhas. Conta com permissão de gravação: {client_email}"
+        except json.JSONDecodeError:
+            results["google_sheets"]["ok"] = False
+            results["google_sheets"]["msg"] = "JSON de Credenciais Inválido"
+            results["google_sheets"]["detail"] = "O conteúdo de GOOGLE_CREDENTIALS_JSON está corrompido ou mal formatado. Deve ser um JSON válido."
+        except Exception as e_sheet:
+            err_str = str(e_sheet)
+            results["google_sheets"]["ok"] = False
+            if "403" in err_str or "PERMISSION_DENIED" in err_str:
+                results["google_sheets"]["msg"] = "Permissão Negada (403 Forbidden)"
+                results["google_sheets"]["detail"] = f"A planilha NÃO foi compartilhada com a conta de serviço! Abra a planilha no Google Sheets, clique em 'Compartilhar' e adicione o e-mail: '{client_email}' com permissão de EDITOR."
+            elif "SpreadsheetNotFound" in err_str or "404" in err_str:
+                results["google_sheets"]["msg"] = "Planilha Não Encontrada (404)"
+                results["google_sheets"]["detail"] = f"O ID '{SPREADSHEET_ID}' não foi localizado. Verifique o ID exato na URL da sua planilha."
+            else:
+                results["google_sheets"]["msg"] = "Erro de Acesso ao Google Sheets"
+                results["google_sheets"]["detail"] = err_str
+
+    return results
+
+@app.get("/registrar-webhook")
+def register_telegram_webhook():
+    if not TELEGRAM_BOT_TOKEN:
+        return HTMLResponse("<h3>Erro: TELEGRAM_BOT_TOKEN não configurado.</h3>", status_code=400)
+    
+    webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/webhook"
+    url_req = f"{TELEGRAM_API_BASE}/setWebhook?url={webhook_url}"
+    try:
+        res = requests.get(url_req, timeout=10).json()
+        if res.get("ok"):
+            return RedirectResponse(url="/?msg=webhook_sucesso", status_code=status.HTTP_302_FOUND)
+        else:
+            return HTMLResponse(f"<h3>Falha ao registrar webhook:</h3><pre>{json.dumps(res, indent=2)}</pre>", status_code=400)
+    except Exception as e:
+        return HTMLResponse(f"<h3>Erro de conexão:</h3><pre>{str(e)}</pre>", status_code=500)
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
@@ -150,6 +294,7 @@ async def telegram_webhook(request: Request):
         "timestamp": timestamp_str,
         "chat_id": "Desconhecido",
         "username": "Desconhecido",
+        "tipo_envio": "Desconhecido",
         "status_gemini": "Pendente",
         "status_sheets": "Pendente",
         "estabelecimento": "-",
@@ -175,14 +320,24 @@ async def telegram_webhook(request: Request):
         log_entry["chat_id"] = str(chat_id)
         log_entry["username"] = str(chat_user)
 
-        # Processar apenas mensagens contendo fotos
-        if "photo" in message:
-            largest_photo = message["photo"][-1]
-            file_id = largest_photo["file_id"]
+        file_id = None
+        if "photo" in message and isinstance(message["photo"], list) and len(message["photo"]) > 0:
+            file_id = message["photo"][-1]["file_id"]
+            log_entry["tipo_envio"] = "Foto (Comprimida)"
+        elif "document" in message:
+            doc = message["document"]
+            mime = doc.get("mime_type", "")
+            file_name = doc.get("file_name", "").lower()
+            if mime.startswith("image/") or file_name.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                file_id = doc["file_id"]
+                log_entry["tipo_envio"] = f"Documento de Imagem ({file_name})"
+            else:
+                send_telegram_message(chat_id, "⚠️ Por favor, envie uma imagem de nota fiscal (JPG, PNG ou foto direta).", message_id)
+                return Response(status_code=status.HTTP_200_OK)
 
+        if file_id:
             send_telegram_message(chat_id, "🔍 Processando comprovante fiscal com Gemini...", message_id)
 
-            # 1. Download e Análise com Gemini
             try:
                 img_bytes = download_telegram_file(file_id)
                 extracted_data = analyze_receipt(img_bytes)
@@ -195,26 +350,24 @@ async def telegram_webhook(request: Request):
                 log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
             except Exception as e_gemini:
                 log_entry["status_gemini"] = "Falha"
-                log_entry["status_sheets"] = "Cancelado (Erro Gemini)"
+                log_entry["status_sheets"] = "Cancelado"
                 log_entry["erro"] = f"Erro no Gemini: {str(e_gemini)}"
                 send_telegram_message(chat_id, f"⚠️ Erro ao analisar comprovante fiscal: {str(e_gemini)}", message_id)
                 processing_logs.insert(0, log_entry)
                 return Response(status_code=status.HTTP_200_OK)
 
-            # 2. Envio para a Planilha do Google Sheets
             try:
                 total_linhas = append_to_sheet(extracted_data)
                 log_entry["status_sheets"] = "Enviado com Sucesso"
-                log_entry["detalhes"] += f" | Linha registrada: {total_linhas}"
+                log_entry["detalhes"] += f" | Linha no Sheets: {total_linhas}"
             except Exception as e_sheets:
                 log_entry["status_sheets"] = "Falha no Envio"
                 log_entry["erro"] = f"Erro Google Sheets: {str(e_sheets)}"
                 logger.error(f"Erro ao salvar na planilha Google: {e_sheets}")
-                send_telegram_message(chat_id, f"⚠️ Dados extraídos, mas falhou ao gravar na Planilha Google: {str(e_sheets)}", message_id)
+                send_telegram_message(chat_id, f"⚠️ Dados extraídos, mas falhou ao gravar no Google Sheets: {str(e_sheets)}", message_id)
                 processing_logs.insert(0, log_entry)
                 return Response(status_code=status.HTTP_200_OK)
 
-            # 3. Notificação no Telegram
             success_msg = (
                 "✅ *Lançamento Registrado com Sucesso!*\n\n"
                 f"• *Data:* {extracted_data.get('data')}\n"
@@ -238,26 +391,74 @@ async def telegram_webhook(request: Request):
         return Response(status_code=status.HTTP_200_OK)
 
 @app.get("/api/logs", response_class=JSONResponse)
-def get_logs_json():
+def get_logs_json(request: Request):
+    host_url = str(request.base_url).rstrip("/")
+    diag = run_prerequisites_diagnostics(host_url)
     return {
         "status": "ok",
+        "diagnosticos": diag,
         "total_logs": len(processing_logs),
-        "spreadsheet_id_configured": bool(SPREADSHEET_ID),
-        "credentials_configured": bool(GOOGLE_CREDENTIALS_JSON),
-        "gemini_configured": bool(GEMINI_API_KEY),
         "logs": processing_logs
     }
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard_logs_page():
+def dashboard_logs_page(request: Request):
+    host_url = str(request.base_url).rstrip("/")
+    if "onrender.com" in RENDER_EXTERNAL_URL:
+        host_url = RENDER_EXTERNAL_URL
+
+    diag = run_prerequisites_diagnostics(host_url)
+
     total_recebidos = len(processing_logs)
     sucessos_sheets = sum(1 for log in processing_logs if log.get("status_sheets") == "Enviado com Sucesso")
     falhas_sheets = sum(1 for log in processing_logs if "Falha" in log.get("status_sheets", "") or "Erro" in log.get("status_sheets", ""))
     total_valor = sum(log.get("valor", 0.0) for log in processing_logs if log.get("status_sheets") == "Enviado com Sucesso")
 
-    sheets_ok = bool(SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON)
-    gemini_ok = bool(GEMINI_API_KEY)
-    telegram_ok = bool(TELEGRAM_BOT_TOKEN)
+    alert_box = ""
+    if request.query_params.get("msg") == "webhook_sucesso":
+        alert_box = """
+        <div style="background: #ecfdf5; border: 1px solid #10b981; color: #065f46; padding: 12px 18px; border-radius: 10px; margin-bottom: 20px; font-weight: 600; font-size: 13px;">
+            🎉 Webhook registrado com sucesso no Telegram! Agora seu bot já pode receber fotos e processar para a planilha.
+        </div>
+        """
+
+    def render_prereq_card(title: str, item_key: str, action_html: str = ""):
+        item = diag[item_key]
+        is_ok = item["ok"]
+        badge = (
+            '<span class="badge-status badge-ok">✓ OK</span>'
+            if is_ok
+            else '<span class="badge-status badge-falha">✕ FALHA</span>'
+        )
+        border_cls = "card-ok" if is_ok else "card-falha"
+        return f"""
+        <div class="prereq-card {border_cls}">
+            <div class="prereq-header">
+                <span class="prereq-title">{title}</span>
+                {badge}
+            </div>
+            <div class="prereq-msg">{item['msg']}</div>
+            <div class="prereq-detail">{item['detail']}</div>
+            {action_html}
+        </div>
+        """
+
+    btn_webhook = ""
+    if not diag["telegram_webhook"]["ok"] and diag["telegram_token"]["ok"]:
+        btn_webhook = f"""
+        <div style="margin-top: 10px;">
+            <a href="/registrar-webhook" class="btn-action">⚡ Registrar Webhook Automaticamente Agora</a>
+        </div>
+        """
+
+    prereq_cards_html = f"""
+    <div class="prereqs-grid">
+        {render_prereq_card("1. Token do Bot Telegram", "telegram_token")}
+        {render_prereq_card("2. Webhook Telegram Conectado", "telegram_webhook", btn_webhook)}
+        {render_prereq_card("3. Inteligência Artificial (Gemini)", "gemini_api")}
+        {render_prereq_card("4. Google Sheets & Permissão", "google_sheets")}
+    </div>
+    """
 
     rows_html = ""
     if not processing_logs:
@@ -267,7 +468,7 @@ def dashboard_logs_page():
                 <div style="padding: 40px 20px; text-align: center; color: #64748b;">
                     <div style="font-size: 32px; margin-bottom: 8px;">📋</div>
                     <div style="font-weight: 600; font-size: 15px; color: #334155;">Nenhum comprovante processado até o momento</div>
-                    <div style="font-size: 13px; margin-top: 4px;">Envie uma foto de nota fiscal, cupom ou recibo no Telegram para ver o registro em tempo real.</div>
+                    <div style="font-size: 13px; margin-top: 4px;">Envie uma foto de nota fiscal ou cupom para o seu bot no Telegram para ver o registro em tempo real.</div>
                 </div>
             </td>
         </tr>
@@ -276,11 +477,10 @@ def dashboard_logs_page():
         for log in processing_logs:
             is_success = log.get("status_sheets") == "Enviado com Sucesso"
             status_badge = (
-                '<span class="badge badge-success">✓ Gravado na Planilha</span>'
+                '<span class="badge-status badge-ok">✓ Gravado no Sheets</span>'
                 if is_success
-                else f'<span class="badge badge-error">✕ {log.get("status_sheets")}</span>'
+                else f'<span class="badge-status badge-falha">✕ {log.get("status_sheets")}</span>'
             )
-
             erro_html = f'<div class="error-msg">{log.get("erro")}</div>' if log.get("erro") else ""
 
             rows_html += f"""
@@ -291,24 +491,17 @@ def dashboard_logs_page():
                 <td>{log.get("tipo_documento")} / {log.get("pagamento")}</td>
                 <td class="font-mono font-bold text-right">R$ {log.get("valor", 0.0):.2f}</td>
                 <td class="text-center">{status_badge}{erro_html}</td>
-                <td class="text-muted font-mono">{log.get("username")}</td>
+                <td class="text-muted font-mono">{log.get("username")} ({log.get("tipo_envio", "-")})</td>
             </tr>
             """
-
-    sheet_id_display = "Não configurada"
-    if SPREADSHEET_ID:
-        if len(SPREADSHEET_ID) > 12:
-            sheet_id_display = f"{SPREADSHEET_ID[:6]}...{SPREADSHEET_ID[-6:]}"
-        else:
-            sheet_id_display = SPREADSHEET_ID
 
     html_content = f"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Log de Auditoria & Google Sheets - Bot Financeiro</title>
-    <meta http-equiv="refresh" content="15">
+    <title>Painel de Diagnóstico & Auditoria Google Sheets</title>
+    <meta http-equiv="refresh" content="20">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -323,6 +516,7 @@ def dashboard_logs_page():
             --primary-dark: #059669;
             --primary-light: #ecfdf5;
             --danger: #ef4444;
+            --danger-dark: #b91c1c;
             --danger-light: #fef2f2;
         }}
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -341,8 +535,8 @@ def dashboard_logs_page():
             background: var(--surface-color);
             border: 1px solid var(--border-color);
             border-radius: 16px;
-            padding: 24px;
-            margin-bottom: 24px;
+            padding: 22px 24px;
+            margin-bottom: 20px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.02);
             display: flex;
             flex-wrap: wrap;
@@ -363,34 +557,102 @@ def dashboard_logs_page():
             color: var(--text-muted);
             margin-top: 4px;
         }}
-        .status-indicators {{
-            display: flex;
-            gap: 12px;
-            flex-wrap: wrap;
-        }}
-        .indicator {{
-            display: flex;
-            align-items: center;
-            gap: 6px;
+        .refresh-btn {{
+            background: #ffffff;
+            border: 1px solid var(--border-color);
+            padding: 8px 16px;
             font-size: 12px;
             font-weight: 600;
-            padding: 6px 12px;
             border-radius: 8px;
-            background: #f1f5f9;
+            cursor: pointer;
+            transition: all 0.2s;
+            color: var(--text-main);
+            text-decoration: none;
+            display: inline-block;
         }}
-        .indicator.active {{
+        .refresh-btn:hover {{ background: #f1f5f9; }}
+        .btn-action {{
+            display: inline-block;
+            background: #0284c7;
+            color: white;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 7px 12px;
+            border-radius: 6px;
+            text-decoration: none;
+            transition: background 0.2s;
+        }}
+        .btn-action:hover {{ background: #0369a1; }}
+        .section-title {{
+            font-size: 14px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .prereqs-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }}
+        .prereq-card {{
+            background: var(--surface-color);
+            border-radius: 12px;
+            padding: 16px 18px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.02);
+            border: 1px solid var(--border-color);
+        }}
+        .prereq-card.card-ok {{
+            border-left: 4px solid var(--primary);
+        }}
+        .prereq-card.card-falha {{
+            border-left: 4px solid var(--danger);
+            background: #fffdfd;
+        }}
+        .prereq-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }}
+        .prereq-title {{
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--text-main);
+        }}
+        .prereq-msg {{
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-main);
+            margin-bottom: 6px;
+        }}
+        .prereq-detail {{
+            font-size: 11.5px;
+            color: var(--text-muted);
+            line-height: 1.45;
+            word-break: break-word;
+        }}
+        .badge-status {{
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 700;
+        }}
+        .badge-ok {{
             background: var(--primary-light);
             color: var(--primary-dark);
+            border: 1px solid #a7f3d0;
         }}
-        .indicator.inactive {{
+        .badge-falha {{
             background: var(--danger-light);
             color: var(--danger);
-        }}
-        .dot {{
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: currentColor;
+            border: 1px solid #fecaca;
         }}
         .kpi-grid {{
             display: grid;
@@ -413,7 +675,7 @@ def dashboard_logs_page():
             letter-spacing: 0.5px;
         }}
         .kpi-card .value {{
-            font-size: 26px;
+            font-size: 24px;
             font-weight: 800;
             font-family: 'JetBrains Mono', monospace;
             margin-top: 4px;
@@ -437,25 +699,10 @@ def dashboard_logs_page():
             display: flex;
             justify-content: space-between;
             align-items: center;
-            background: #ffffff;
         }}
         .table-header h2 {{
             font-size: 15px;
             font-weight: 700;
-        }}
-        .refresh-btn {{
-            background: #ffffff;
-            border: 1px solid var(--border-color);
-            padding: 6px 14px;
-            font-size: 12px;
-            font-weight: 600;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.2s;
-            color: var(--text-main);
-        }}
-        .refresh-btn:hover {{
-            background: #f1f5f9;
         }}
         table {{
             width: 100%;
@@ -478,31 +725,12 @@ def dashboard_logs_page():
             border-bottom: 1px solid var(--border-color);
             color: #1e293b;
         }}
-        tr:hover td {{
-            background-color: #f8fafc;
-        }}
+        tr:hover td {{ background-color: #f8fafc; }}
         .font-mono {{ font-family: 'JetBrains Mono', monospace; }}
         .font-bold {{ font-weight: 700; }}
         .text-right {{ text-align: right; }}
         .text-center {{ text-align: center; }}
         .text-muted {{ color: var(--text-muted); }}
-        .badge {{
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 6px;
-            font-size: 11px;
-            font-weight: 700;
-        }}
-        .badge-success {{
-            background: var(--primary-light);
-            color: var(--primary-dark);
-            border: 1px solid #a7f3d0;
-        }}
-        .badge-error {{
-            background: var(--danger-light);
-            color: var(--danger);
-            border: 1px solid #fecaca;
-        }}
         .pill-category {{
             background: #f1f5f9;
             color: #334155;
@@ -516,6 +744,7 @@ def dashboard_logs_page():
             color: var(--danger);
             margin-top: 4px;
             font-family: 'JetBrains Mono', monospace;
+            word-break: break-word;
         }}
         footer {{
             margin-top: 24px;
@@ -532,51 +761,50 @@ def dashboard_logs_page():
 </head>
 <body>
     <div class="container">
+        {alert_box}
+
         <header>
             <div class="title-group">
-                <h1>📊 Monitor de Auditoria & Google Sheets</h1>
-                <p>Verificação em tempo real dos comprovantes recebidos e gravados na planilha</p>
+                <h1>🔍 Diagnóstico & Auditoria Fiscal (Google Sheets)</h1>
+                <p>Verificação ao vivo de pré-requisitos, webhook do Telegram e histórico de sincronização</p>
             </div>
-            <div class="status-indicators">
-                <div class="indicator {'active' if sheets_ok else 'inactive'}">
-                    <span class="dot"></span> Google Sheets {'Conectado' if sheets_ok else 'Pendente'}
-                </div>
-                <div class="indicator {'active' if gemini_ok else 'inactive'}">
-                    <span class="dot"></span> Gemini AI {'Ativo' if gemini_ok else 'Sem Chave'}
-                </div>
-                <div class="indicator {'active' if telegram_ok else 'inactive'}">
-                    <span class="dot"></span> Telegram {'Pronto' if telegram_ok else 'Sem Token'}
-                </div>
+            <div>
+                <a href="/" class="refresh-btn">↻ Testar Novamente (Auto 20s)</a>
             </div>
         </header>
 
+        <div class="section-title">
+            <span>Diagnóstico dos Pré-Requisitos do Sistema</span>
+        </div>
+        {prereq_cards_html}
+
         <div class="kpi-grid">
             <div class="kpi-card">
-                <div class="label">Gravados na Planilha</div>
+                <div class="label">Gravados no Google Sheets</div>
                 <div class="value" style="color: var(--primary-dark);">{sucessos_sheets}</div>
-                <div class="subtext">Sincronizados com o Google Sheets</div>
+                <div class="subtext">Sincronizados com sucesso</div>
             </div>
             <div class="kpi-card">
-                <div class="label">Total Processados</div>
-                <div class="value">{total_recebidos}</div>
-                <div class="subtext">Comprovantes via Telegram</div>
+                <div class="label">Falhas de Envio</div>
+                <div class="value" style="color: {'var(--danger)' if falhas_sheets > 0 else 'var(--text-muted)'};">{falhas_sheets}</div>
+                <div class="subtext">Erros detectados</div>
             </div>
             <div class="kpi-card">
-                <div class="label">Valor Total Registrado</div>
+                <div class="label">Valor Total Auditado</div>
                 <div class="value">R$ {total_valor:.2f}</div>
-                <div class="subtext">Soma das notas válidas</div>
+                <div class="subtext">Lançamentos válidos</div>
             </div>
             <div class="kpi-card">
-                <div class="label">ID da Planilha Ativa</div>
-                <div class="value font-mono" style="font-size: 15px; margin-top: 8px;">{sheet_id_display}</div>
-                <div class="subtext">Aba 0 (Principal)</div>
+                <div class="label">Total Recebidos</div>
+                <div class="value">{total_recebidos}</div>
+                <div class="subtext">Mensagens no Telegram</div>
             </div>
         </div>
 
         <div class="table-card">
             <div class="table-header">
-                <h2>Histórico de Envios para a Planilha do Google</h2>
-                <button class="refresh-btn" onclick="window.location.reload()">↻ Atualizar (Auto 15s)</button>
+                <h2>Histórico de Envios para a Planilha do Google Sheets</h2>
+                <span class="text-muted font-mono" style="font-size: 11px;">Endpoint ativo: /webhook</span>
             </div>
             <div style="overflow-x: auto;">
                 <table>
@@ -599,8 +827,8 @@ def dashboard_logs_page():
         </div>
 
         <footer>
-            <div>Auditor Fiscal AI · Integração Telegram & Google Sheets</div>
-            <div>Atualização automática a cada 15 segundos</div>
+            <div>Auditor Fiscal AI · Telegram & Google Sheets Pipeline</div>
+            <div>Atualização automática a cada 20 segundos</div>
         </footer>
     </div>
 </body>
