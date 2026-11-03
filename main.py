@@ -27,7 +27,6 @@ TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEG
 
 app = FastAPI(title="Auditor Fiscal - Bot & Google Sheets Pipeline")
 
-# Inicialização segura do cliente Gemini
 genai_client = None
 if GEMINI_API_KEY:
     try:
@@ -35,7 +34,6 @@ if GEMINI_API_KEY:
     except Exception as e_init:
         logger.error(f"Erro ao inicializar cliente GenAI: {e_init}")
 
-# Armazenamento em memória dos logs de processamento e envio
 processing_logs: List[Dict[str, Any]] = []
 
 def get_sheets_client():
@@ -152,9 +150,6 @@ def append_to_sheet(data: Dict[str, Any]) -> int:
     worksheet.append_row(row)
     return 1
 
-# ----------------------------------------------------
-# Diagnóstico Rápido e Não-Bloqueante (Timeout de 3s)
-# ----------------------------------------------------
 @app.get("/api/diagnostico", response_class=JSONResponse)
 def run_fast_diagnostics():
     host_url = RENDER_EXTERNAL_URL.rstrip("/")
@@ -167,7 +162,6 @@ def run_fast_diagnostics():
         "google_sheets": {"ok": False, "msg": "", "detail": "", "client_email": ""},
     }
 
-    # 1. Telegram Token
     if not TELEGRAM_BOT_TOKEN:
         results["telegram_token"]["ok"] = False
         results["telegram_token"]["msg"] = "Variável TELEGRAM_BOT_TOKEN ausente"
@@ -191,7 +185,6 @@ def run_fast_diagnostics():
             results["telegram_token"]["msg"] = "Erro de conexão com api.telegram.org"
             results["telegram_token"]["detail"] = str(e)
 
-    # 2. Telegram Webhook
     if results["telegram_token"]["ok"]:
         try:
             r_wh = requests.get(f"{TELEGRAM_API_BASE}/getWebhookInfo", timeout=3.5)
@@ -221,13 +214,11 @@ def run_fast_diagnostics():
         results["telegram_webhook"]["msg"] = "Não verificado (Token inválido)"
         results["telegram_webhook"]["detail"] = "Configure o token do Telegram primeiro."
 
-    # 3. Gemini API
     if not GEMINI_API_KEY:
         results["gemini_api"]["ok"] = False
         results["gemini_api"]["msg"] = "Variável GEMINI_API_KEY ausente"
         results["gemini_api"]["detail"] = "Adicione a chave GEMINI_API_KEY no painel Environment do Render."
     else:
-        # Verificação rápida da chave sem gastar cota nem travar o request
         if len(GEMINI_API_KEY) > 10 and GEMINI_API_KEY.startswith("AIza"):
             results["gemini_api"]["ok"] = True
             results["gemini_api"]["msg"] = "Chave Configurada & Pronta"
@@ -237,7 +228,6 @@ def run_fast_diagnostics():
             results["gemini_api"]["msg"] = "Chave Carregada"
             results["gemini_api"]["detail"] = "Chave configurada nas variáveis de ambiente."
 
-    # 4. Google Sheets
     client_email = ""
     if not GOOGLE_CREDENTIALS_JSON:
         results["google_sheets"]["ok"] = False
@@ -407,9 +397,333 @@ def get_logs_json():
         "logs": processing_logs
     }
 
-# ----------------------------------------------------
-# Página Principal (Carregamento Ultrarrápido Instantâneo)
-# ----------------------------------------------------
+# Template HTML estático (NÃO usa f-string para evitar conflito com chaves do CSS e JS)
+HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel de Diagnóstico & Auditoria Fiscal</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #f8fafc;
+            --surface-color: #ffffff;
+            --border-color: #e2e8f0;
+            --text-main: #0f172a;
+            --text-muted: #64748b;
+            --primary: #10b981;
+            --primary-dark: #059669;
+            --primary-light: #ecfdf5;
+            --danger: #ef4444;
+            --danger-light: #fef2f2;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding: 24px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 20px 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+        }
+        .title-group h1 {
+            font-size: 20px;
+            font-weight: 800;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .title-group p { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+        .refresh-btn {
+            background: #ffffff;
+            border: 1px solid var(--border-color);
+            padding: 8px 16px;
+            font-size: 12px;
+            font-weight: 600;
+            border-radius: 8px;
+            cursor: pointer;
+            color: var(--text-main);
+            text-decoration: none;
+        }
+        .refresh-btn:hover { background: #f1f5f9; }
+        .btn-action {
+            display: inline-block;
+            background: #0284c7;
+            color: white;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 7px 12px;
+            border-radius: 6px;
+            text-decoration: none;
+            margin-top: 8px;
+        }
+        .btn-action:hover { background: #0369a1; }
+        .section-title {
+            font-size: 14px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+        }
+        .prereqs-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .prereq-card {
+            background: var(--surface-color);
+            border-radius: 12px;
+            padding: 16px 18px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.02);
+            border: 1px solid var(--border-color);
+            transition: all 0.3s;
+        }
+        .prereq-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .prereq-title { font-size: 13px; font-weight: 700; }
+        .prereq-msg { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+        .prereq-detail { font-size: 11.5px; color: var(--text-muted); line-height: 1.45; word-break: break-word; }
+        .badge-status {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        .badge-ok { background: var(--primary-light); color: var(--primary-dark); border: 1px solid #a7f3d0; }
+        .badge-falha { background: var(--danger-light); color: var(--danger); border: 1px solid #fecaca; }
+        .badge-loading { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .kpi-card {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 18px 20px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.02);
+        }
+        .kpi-card .label { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; }
+        .kpi-card .value { font-size: 24px; font-weight: 800; font-family: 'JetBrains Mono', monospace; margin-top: 4px; }
+        .kpi-card .subtext { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+        .table-card {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+        }
+        .table-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .table-header h2 { font-size: 15px; font-weight: 700; }
+        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
+        th {
+            background: #f8fafc;
+            padding: 12px 18px;
+            font-weight: 700;
+            font-size: 11px;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border-color);
+        }
+        td { padding: 14px 18px; border-bottom: 1px solid var(--border-color); color: #1e293b; }
+        tr:hover td { background-color: #f8fafc; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        .font-bold { font-weight: 700; }
+        .text-right { text-align: right; }
+        .text-center { text-align: center; }
+        .text-muted { color: var(--text-muted); }
+        .pill-category { background: #f1f5f9; color: #334155; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+        .error-msg { font-size: 11px; color: var(--danger); margin-top: 4px; font-family: 'JetBrains Mono', monospace; }
+        footer { margin-top: 24px; text-align: center; font-size: 12px; color: var(--text-muted); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        __ALERT_BOX__
+
+        <header>
+            <div class="title-group">
+                <h1>🔍 Diagnóstico & Auditoria Fiscal (Google Sheets)</h1>
+                <p>Verificação de pré-requisitos, webhook do Telegram e histórico de sincronização</p>
+            </div>
+            <div>
+                <button class="refresh-btn" onclick="executarDiagnostico()">↻ Testar Conexões</button>
+            </div>
+        </header>
+
+        <div class="section-title">Pré-Requisitos do Sistema</div>
+        <div class="prereqs-grid">
+            <div id="card-token" class="prereq-card">
+                <div class="prereq-header">
+                    <span class="prereq-title">1. Token do Bot Telegram</span>
+                    <span id="badge-token" class="badge-status badge-loading">Testando...</span>
+                </div>
+                <div id="msg-token" class="prereq-msg">Verificando com api.telegram.org...</div>
+                <div id="detail-token" class="prereq-detail">Aguardando resposta do servidor.</div>
+            </div>
+
+            <div id="card-webhook" class="prereq-card">
+                <div class="prereq-header">
+                    <span class="prereq-title">2. Webhook Telegram Conectado</span>
+                    <span id="badge-webhook" class="badge-status badge-loading">Testando...</span>
+                </div>
+                <div id="msg-webhook" class="prereq-msg">Verificando rota /webhook...</div>
+                <div id="detail-webhook" class="prereq-detail">Checando se o Telegram está roteando para este servidor.</div>
+                <div id="action-webhook"></div>
+            </div>
+
+            <div id="card-gemini" class="prereq-card">
+                <div class="prereq-header">
+                    <span class="prereq-title">3. Inteligência Artificial (Gemini)</span>
+                    <span id="badge-gemini" class="badge-status badge-loading">Testando...</span>
+                </div>
+                <div id="msg-gemini" class="prereq-msg">Checando chave GEMINI_API_KEY...</div>
+                <div id="detail-gemini" class="prereq-detail">Validando credencial da IA.</div>
+            </div>
+
+            <div id="card-sheets" class="prereq-card">
+                <div class="prereq-header">
+                    <span class="prereq-title">4. Google Sheets & Permissão</span>
+                    <span id="badge-sheets" class="badge-status badge-loading">Testando...</span>
+                </div>
+                <div id="msg-sheets" class="prereq-msg">Verificando planilha e conta de serviço...</div>
+                <div id="detail-sheets" class="prereq-detail">Checando permissões de edição no Google Drive.</div>
+            </div>
+        </div>
+
+        <div class="kpi-grid">
+            <div class="kpi-card">
+                <div class="label">Gravados no Google Sheets</div>
+                <div class="value" style="color: var(--primary-dark);">__SUCESSOS_SHEETS__</div>
+                <div class="subtext">Sincronizados com sucesso</div>
+            </div>
+            <div class="kpi-card">
+                <div class="label">Falhas de Envio</div>
+                <div class="value" style="color: var(--danger);">__FALHAS_SHEETS__</div>
+                <div class="subtext">Erros detectados</div>
+            </div>
+            <div class="kpi-card">
+                <div class="label">Valor Total Registrado</div>
+                <div class="value">R$ __TOTAL_VALOR__</div>
+                <div class="subtext">Soma das notas enviadas</div>
+            </div>
+            <div class="kpi-card">
+                <div class="label">Total Recebidos</div>
+                <div class="value">__TOTAL_RECEBIDOS__</div>
+                <div class="subtext">Mensagens via Telegram</div>
+            </div>
+        </div>
+
+        <div class="table-card">
+            <div class="table-header">
+                <h2>Histórico de Envios para a Planilha do Google Sheets</h2>
+                <span class="text-muted font-mono" style="font-size: 11px;">Endpoint ativo: /webhook</span>
+            </div>
+            <div style="overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Data/Hora</th>
+                            <th>Estabelecimento</th>
+                            <th>Categoria</th>
+                            <th>Doc / Pagamento</th>
+                            <th class="text-right">Valor</th>
+                            <th class="text-center">Status Google Sheets</th>
+                            <th>Usuário Telegram</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        __ROWS_HTML__
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <footer>
+            <div>Auditor Fiscal AI · Telegram & Google Sheets Pipeline</div>
+        </footer>
+    </div>
+
+    <script>
+        async function executarDiagnostico() {
+            try {
+                const res = await fetch('/api/diagnostico');
+                const data = await res.json();
+                
+                atualizarCard('token', data.telegram_token);
+                atualizarCard('webhook', data.telegram_webhook);
+                if (!data.telegram_webhook.ok && data.telegram_token.ok) {
+                    document.getElementById('action-webhook').innerHTML = 
+                        '<a href="/registrar-webhook" class="btn-action">⚡ Registrar Webhook Automaticamente Agora</a>';
+                } else {
+                    document.getElementById('action-webhook').innerHTML = '';
+                }
+                atualizarCard('gemini', data.gemini_api);
+                atualizarCard('sheets', data.google_sheets);
+
+            } catch (err) {
+                console.error("Falha ao rodar diagnóstico:", err);
+            }
+        }
+
+        function atualizarCard(prefix, item) {
+            const card = document.getElementById('card-' + prefix);
+            const badge = document.getElementById('badge-' + prefix);
+            const msg = document.getElementById('msg-' + prefix);
+            const detail = document.getElementById('detail-' + prefix);
+
+            if (item.ok) {
+                card.style.borderLeft = '4px solid #10b981';
+                card.style.background = '#ffffff';
+                badge.className = 'badge-status badge-ok';
+                badge.innerText = '✓ OK';
+            } else {
+                card.style.borderLeft = '4px solid #ef4444';
+                card.style.background = '#fffdfd';
+                badge.className = 'badge-status badge-falha';
+                badge.innerText = '✕ FALHA';
+            }
+            msg.innerText = item.msg;
+            detail.innerText = item.detail;
+        }
+
+        window.addEventListener('DOMContentLoaded', executarDiagnostico);
+    </script>
+</body>
+</html>
+"""
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard_logs_page(request: Request):
     total_recebidos = len(processing_logs)
@@ -419,11 +733,12 @@ def dashboard_logs_page(request: Request):
 
     alert_box = ""
     if request.query_params.get("msg") == "webhook_sucesso":
-        alert_box = """
-        <div style="background: #ecfdf5; border: 1px solid #10b981; color: #065f46; padding: 12px 18px; border-radius: 10px; margin-bottom: 20px; font-weight: 600; font-size: 13px;">
-            🎉 Webhook registrado com sucesso no Telegram! Agora seu bot já recebe mensagens e grava na planilha.
-        </div>
-        """
+        alert_box = (
+            '<div style="background: #ecfdf5; border: 1px solid #10b981; color: #065f46; '
+            'padding: 12px 18px; border-radius: 10px; margin-bottom: 20px; font-weight: 600; font-size: 13px;">'
+            '🎉 Webhook registrado com sucesso no Telegram! Agora seu bot já recebe mensagens e grava na planilha.'
+            '</div>'
+        )
 
     rows_html = ""
     if not processing_logs:
@@ -460,341 +775,14 @@ def dashboard_logs_page(request: Request):
             </tr>
             """
 
-    html_content = f"""<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Painel de Diagnóstico & Auditoria Fiscal</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <style>
-        :root {{
-            --bg-color: #f8fafc;
-            --surface-color: #ffffff;
-            --border-color: #e2e8f0;
-            --text-main: #0f172a;
-            --text-muted: #64748b;
-            --primary: #10b981;
-            --primary-dark: #059669;
-            --primary-light: #ecfdf5;
-            --danger: #ef4444;
-            --danger-light: #fef2f2;
-        }}
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-main);
-            min-height: 100vh;
-            padding: 24px;
-        }}
-        .container {{ max-width: 1200px; margin: 0 auto; }}
-        header {{
-            background: var(--surface-color);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 20px 24px;
-            margin-bottom: 20px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: space-between;
-            align-items: center;
-            gap: 16px;
-        }}
-        .title-group h1 {{
-            font-size: 20px;
-            font-weight: 800;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }}
-        .title-group p {{ font-size: 13px; color: var(--text-muted); margin-top: 4px; }}
-        .refresh-btn {{
-            background: #ffffff;
-            border: 1px solid var(--border-color);
-            padding: 8px 16px;
-            font-size: 12px;
-            font-weight: 600;
-            border-radius: 8px;
-            cursor: pointer;
-            color: var(--text-main);
-            text-decoration: none;
-        }}
-        .refresh-btn:hover {{ background: #f1f5f9; }}
-        .btn-action {{
-            display: inline-block;
-            background: #0284c7;
-            color: white;
-            font-size: 11px;
-            font-weight: 700;
-            padding: 7px 12px;
-            border-radius: 6px;
-            text-decoration: none;
-            margin-top: 8px;
-        }}
-        .btn-action:hover {{ background: #0369a1; }}
-        .section-title {{
-            font-size: 14px;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: var(--text-muted);
-            margin-bottom: 12px;
-        }}
-        .prereqs-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
-            gap: 16px;
-            margin-bottom: 24px;
-        }}
-        .prereq-card {{
-            background: var(--surface-color);
-            border-radius: 12px;
-            padding: 16px 18px;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.02);
-            border: 1px solid var(--border-color);
-            transition: all 0.3s;
-        }}
-        .prereq-header {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 8px;
-        }}
-        .prereq-title {{ font-size: 13px; font-weight: 700; }}
-        .prereq-msg {{ font-size: 13px; font-weight: 600; margin-bottom: 6px; }}
-        .prereq-detail {{ font-size: 11.5px; color: var(--text-muted); line-height: 1.45; word-break: break-word; }}
-        .badge-status {{
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 6px;
-            font-size: 11px;
-            font-weight: 700;
-        }}
-        .badge-ok {{ background: var(--primary-light); color: var(--primary-dark); border: 1px solid #a7f3d0; }}
-        .badge-falha {{ background: var(--danger-light); color: var(--danger); border: 1px solid #fecaca; }}
-        .badge-loading {{ background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }}
-        .kpi-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 16px;
-            margin-bottom: 24px;
-        }}
-        .kpi-card {{
-            background: var(--surface-color);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 18px 20px;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.02);
-        }}
-        .kpi-card .label {{ font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; }}
-        .kpi-card .value {{ font-size: 24px; font-weight: 800; font-family: 'JetBrains Mono', monospace; margin-top: 4px; }}
-        .kpi-card .subtext {{ font-size: 11px; color: var(--text-muted); margin-top: 4px; }}
-        .table-card {{
-            background: var(--surface-color);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            overflow: hidden;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-        }}
-        .table-header {{
-            padding: 16px 20px;
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }}
-        .table-header h2 {{ font-size: 15px; font-weight: 700; }}
-        table {{ width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }}
-        th {{
-            background: #f8fafc;
-            padding: 12px 18px;
-            font-weight: 700;
-            font-size: 11px;
-            text-transform: uppercase;
-            color: var(--text-muted);
-            border-bottom: 1px solid var(--border-color);
-        }}
-        td {{ padding: 14px 18px; border-bottom: 1px solid var(--border-color); color: #1e293b; }}
-        tr:hover td {{ background-color: #f8fafc; }}
-        .font-mono {{ font-family: 'JetBrains Mono', monospace; }}
-        .font-bold {{ font-weight: 700; }}
-        .text-right {{ text-align: right; }}
-        .text-center {{ text-align: center; }}
-        .text-muted {{ color: var(--text-muted); }}
-        .pill-category {{ background: #f1f5f9; color: #334155; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }}
-        .error-msg {{ font-size: 11px; color: var(--danger); margin-top: 4px; font-family: 'JetBrains Mono', monospace; }}
-        footer {{ margin-top: 24px; text-align: center; font-size: 12px; color: var(--text-muted); }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        {alert_box}
+    html_content = (
+        HTML_DASHBOARD_TEMPLATE
+        .replace("__ALERT_BOX__", alert_box)
+        .replace("__ROWS_HTML__", rows_html)
+        .replace("__SUCESSOS_SHEETS__", str(sucessos_sheets))
+        .replace("__FALHAS_SHEETS__", str(falhas_sheets))
+        .replace("__TOTAL_VALOR__", f"{total_valor:.2f}")
+        .replace("__TOTAL_RECEBIDOS__", str(total_recebidos))
+    )
 
-        <header>
-            <div class="title-group">
-                <h1>🔍 Diagnóstico & Auditoria Fiscal (Google Sheets)</h1>
-                <p>Verificação de pré-requisitos, webhook do Telegram e histórico de sincronização</p>
-            </div>
-            <div>
-                <button class="refresh-btn" onclick="executarDiagnostico()">↻ Testar Conexões</button>
-            </div>
-        </header>
-
-        <div class="section-title">Pré-Requisitos do Sistema</div>
-        <div class="prereqs-grid">
-            <!-- Card 1: Telegram Token -->
-            <div id="card-token" class="prereq-card">
-                <div class="prereq-header">
-                    <span class="prereq-title">1. Token do Bot Telegram</span>
-                    <span id="badge-token" class="badge-status badge-loading">Testando...</span>
-                </div>
-                <div id="msg-token" class="prereq-msg">Verificando com api.telegram.org...</div>
-                <div id="detail-token" class="prereq-detail">Aguardando resposta do servidor.</div>
-            </div>
-
-            <!-- Card 2: Telegram Webhook -->
-            <div id="card-webhook" class="prereq-card">
-                <div class="prereq-header">
-                    <span class="prereq-title">2. Webhook Telegram Conectado</span>
-                    <span id="badge-webhook" class="badge-status badge-loading">Testando...</span>
-                </div>
-                <div id="msg-webhook" class="prereq-msg">Verificando rota /webhook...</div>
-                <div id="detail-webhook" class="prereq-detail">Checando se o Telegram está roteando para este servidor.</div>
-                <div id="action-webhook"></div>
-            </div>
-
-            <!-- Card 3: Gemini AI -->
-            <div id="card-gemini" class="prereq-card">
-                <div class="prereq-header">
-                    <span class="prereq-title">3. Inteligência Artificial (Gemini)</span>
-                    <span id="badge-gemini" class="badge-status badge-loading">Testando...</span>
-                </div>
-                <div id="msg-gemini" class="prereq-msg">Checando chave GEMINI_API_KEY...</div>
-                <div id="detail-gemini" class="prereq-detail">Validando credencial da IA.</div>
-            </div>
-
-            <!-- Card 4: Google Sheets -->
-            <div id="card-sheets" class="prereq-card">
-                <div class="prereq-header">
-                    <span class="prereq-title">4. Google Sheets & Permissão</span>
-                    <span id="badge-sheets" class="badge-status badge-loading">Testando...</span>
-                </div>
-                <div id="msg-sheets" class="prereq-msg">Verificando planilha e conta de serviço...</div>
-                <div id="detail-sheets" class="prereq-detail">Checando permissões de edição no Google Drive.</div>
-            </div>
-        </div>
-
-        <div class="kpi-grid">
-            <div class="kpi-card">
-                <div class="label">Gravados no Google Sheets</div>
-                <div class="value" style="color: var(--primary-dark);">{sucessos_sheets}</div>
-                <div class="subtext">Sincronizados com sucesso</div>
-            </div>
-            <div class="kpi-card">
-                <div class="label">Falhas de Envio</div>
-                <div class="value" style="color: {'var(--danger)' if falhas_sheets > 0 else 'var(--text-muted)'};">{falhas_sheets}</div>
-                <div class="subtext">Erros detectados</div>
-            </div>
-            <div class="kpi-card">
-                <div class="label">Valor Total Registrado</div>
-                <div class="value">R$ {total_valor:.2f}</div>
-                <div class="subtext">Soma das notas enviadas</div>
-            </div>
-            <div class="kpi-card">
-                <div class="label">Total Recebidos</div>
-                <div class="value">{total_recebidos}</div>
-                <div class="subtext">Mensagens via Telegram</div>
-            </div>
-        </div>
-
-        <div class="table-card">
-            <div class="table-header">
-                <h2>Histórico de Envios para a Planilha do Google Sheets</h2>
-                <span class="text-muted font-mono" style="font-size: 11px;">Endpoint ativo: /webhook</span>
-            </div>
-            <div style="overflow-x: auto;">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Data/Hora</th>
-                            <th>Estabelecimento</th>
-                            <th>Categoria</th>
-                            <th>Doc / Pagamento</th>
-                            <th class="text-right">Valor</th>
-                            <th class="text-center">Status Google Sheets</th>
-                            <th>Usuário Telegram</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {rows_html}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-        <footer>
-            <div>Auditor Fiscal AI · Telegram & Google Sheets Pipeline</div>
-        </footer>
-    </div>
-
-    <script>
-        async function executarDiagnostico() {
-            try {
-                const res = await fetch('/api/diagnostico');
-                const data = await res.json();
-                
-                // 1. Token
-                atualizarCard('token', data.telegram_token);
-
-                // 2. Webhook
-                atualizarCard('webhook', data.telegram_webhook);
-                if (!data.telegram_webhook.ok && data.telegram_token.ok) {
-                    document.getElementById('action-webhook').innerHTML = 
-                        '<a href="/registrar-webhook" class="btn-action">⚡ Registrar Webhook Automaticamente Agora</a>';
-                } else {
-                    document.getElementById('action-webhook').innerHTML = '';
-                }
-
-                // 3. Gemini
-                atualizarCard('gemini', data.gemini_api);
-
-                // 4. Sheets
-                atualizarCard('sheets', data.google_sheets);
-
-            } catch (err) {
-                console.error("Falha ao rodar diagnóstico:", err);
-            }
-        }
-
-        function atualizarCard(prefix, item) {
-            const card = document.getElementById('card-' + prefix);
-            const badge = document.getElementById('badge-' + prefix);
-            const msg = document.getElementById('msg-' + prefix);
-            const detail = document.getElementById('detail-' + prefix);
-
-            if (item.ok) {
-                card.style.borderLeft = '4px solid #10b981';
-                card.style.background = '#ffffff';
-                badge.className = 'badge-status badge-ok';
-                badge.innerText = '✓ OK';
-            } else {
-                card.style.borderLeft = '4px solid #ef4444';
-                card.style.background = '#fffdfd';
-                badge.className = 'badge-status badge-falha';
-                badge.innerText = '✕ FALHA';
-            }
-            msg.innerText = item.msg;
-            detail.innerText = item.detail;
-        }
-
-        // Executar diagnóstico em segundo plano assim que a página carregar
-        window.addEventListener('DOMContentLoaded', executarDiagnostico);
-    </script>
-</body>
-</html>
-"""
     return HTMLResponse(content=html_content, status_code=200)

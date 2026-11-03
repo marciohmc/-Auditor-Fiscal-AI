@@ -397,57 +397,7 @@ def get_logs_json():
         "logs": processing_logs
     }
 
-@app.get("/", response_class=HTMLResponse)
-def dashboard_logs_page(request: Request):
-    total_recebidos = len(processing_logs)
-    sucessos_sheets = sum(1 for log in processing_logs if log.get("status_sheets") == "Enviado com Sucesso")
-    falhas_sheets = sum(1 for log in processing_logs if "Falha" in log.get("status_sheets", "") or "Erro" in log.get("status_sheets", ""))
-    total_valor = sum(log.get("valor", 0.0) for log in processing_logs if log.get("status_sheets") == "Enviado com Sucesso")
-
-    alert_box = ""
-    if request.query_params.get("msg") == "webhook_sucesso":
-        alert_box = """
-        <div style="background: #ecfdf5; border: 1px solid #10b981; color: #065f46; padding: 12px 18px; border-radius: 10px; margin-bottom: 20px; font-weight: 600; font-size: 13px;">
-            🎉 Webhook registrado com sucesso no Telegram! Agora seu bot já recebe mensagens e grava na planilha.
-        </div>
-        """
-
-    rows_html = ""
-    if not processing_logs:
-        rows_html = """
-        <tr>
-            <td colspan="7" class="empty-state">
-                <div style="padding: 40px 20px; text-align: center; color: #64748b;">
-                    <div style="font-size: 32px; margin-bottom: 8px;">📋</div>
-                    <div style="font-weight: 600; font-size: 15px; color: #334155;">Nenhum comprovante processado até o momento</div>
-                    <div style="font-size: 13px; margin-top: 4px;">Envie uma foto de nota fiscal no Telegram para ver o registro em tempo real.</div>
-                </div>
-            </td>
-        </tr>
-        """
-    else:
-        for log in processing_logs:
-            is_success = log.get("status_sheets") == "Enviado com Sucesso"
-            status_badge = (
-                '<span class="badge-status badge-ok">✓ Gravado no Sheets</span>'
-                if is_success
-                else f'<span class="badge-status badge-falha">✕ {log.get("status_sheets")}</span>'
-            )
-            erro_html = f'<div class="error-msg">{log.get("erro")}</div>' if log.get("erro") else ""
-
-            rows_html += f"""
-            <tr>
-                <td class="font-mono text-muted">{log.get("timestamp")}</td>
-                <td class="font-bold">{log.get("estabelecimento")}</td>
-                <td><span class="pill-category">{log.get("categoria")}</span></td>
-                <td>{log.get("tipo_documento")} / {log.get("pagamento")}</td>
-                <td class="font-mono font-bold text-right">R$ {log.get("valor", 0.0):.2f}</td>
-                <td class="text-center">{status_badge}{erro_html}</td>
-                <td class="text-muted font-mono">{log.get("username")} ({log.get("tipo_envio", "-")})</td>
-            </tr>
-            """
-
-    html_content = f"""<!DOCTYPE html>
+HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
@@ -457,7 +407,7 @@ def dashboard_logs_page(request: Request):
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
-        :root {{
+        :root {
             --bg-color: #f8fafc;
             --surface-color: #ffffff;
             --border-color: #e2e8f0;
@@ -468,17 +418,17 @@ def dashboard_logs_page(request: Request):
             --primary-light: #ecfdf5;
             --danger: #ef4444;
             --danger-light: #fef2f2;
-        }}
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
             font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
             background-color: var(--bg-color);
             color: var(--text-main);
             min-height: 100vh;
             padding: 24px;
-        }}
-        .container {{ max-width: 1200px; margin: 0 auto; }}
-        header {{
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header {
             background: var(--surface-color);
             border: 1px solid var(--border-color);
             border-radius: 16px;
@@ -490,16 +440,16 @@ def dashboard_logs_page(request: Request):
             justify-content: space-between;
             align-items: center;
             gap: 16px;
-        }}
-        .title-group h1 {{
+        }
+        .title-group h1 {
             font-size: 20px;
             font-weight: 800;
             display: flex;
             align-items: center;
             gap: 10px;
-        }}
-        .title-group p {{ font-size: 13px; color: var(--text-muted); margin-top: 4px; }}
-        .refresh-btn {{
+        }
+        .title-group p { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+        .refresh-btn {
             background: #ffffff;
             border: 1px solid var(--border-color);
             padding: 8px 16px;
@@ -509,9 +459,9 @@ def dashboard_logs_page(request: Request):
             cursor: pointer;
             color: var(--text-main);
             text-decoration: none;
-        }}
-        .refresh-btn:hover {{ background: #f1f5f9; }}
-        .btn-action {{
+        }
+        .refresh-btn:hover { background: #f1f5f9; }
+        .btn-action {
             display: inline-block;
             background: #0284c7;
             color: white;
@@ -521,82 +471,82 @@ def dashboard_logs_page(request: Request):
             border-radius: 6px;
             text-decoration: none;
             margin-top: 8px;
-        }}
-        .btn-action:hover {{ background: #0369a1; }}
-        .section-title {{
+        }
+        .btn-action:hover { background: #0369a1; }
+        .section-title {
             font-size: 14px;
             font-weight: 700;
             text-transform: uppercase;
             letter-spacing: 0.5px;
             color: var(--text-muted);
             margin-bottom: 12px;
-        }}
-        .prereqs-grid {{
+        }
+        .prereqs-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
             gap: 16px;
             margin-bottom: 24px;
-        }}
-        .prereq-card {{
+        }
+        .prereq-card {
             background: var(--surface-color);
             border-radius: 12px;
             padding: 16px 18px;
             box-shadow: 0 1px 2px rgba(0,0,0,0.02);
             border: 1px solid var(--border-color);
             transition: all 0.3s;
-        }}
-        .prereq-header {{
+        }
+        .prereq-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 8px;
-        }}
-        .prereq-title {{ font-size: 13px; font-weight: 700; }}
-        .prereq-msg {{ font-size: 13px; font-weight: 600; margin-bottom: 6px; }}
-        .prereq-detail {{ font-size: 11.5px; color: var(--text-muted); line-height: 1.45; word-break: break-word; }}
-        .badge-status {{
+        }
+        .prereq-title { font-size: 13px; font-weight: 700; }
+        .prereq-msg { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+        .prereq-detail { font-size: 11.5px; color: var(--text-muted); line-height: 1.45; word-break: break-word; }
+        .badge-status {
             display: inline-block;
             padding: 3px 8px;
             border-radius: 6px;
             font-size: 11px;
             font-weight: 700;
-        }}
-        .badge-ok {{ background: var(--primary-light); color: var(--primary-dark); border: 1px solid #a7f3d0; }}
-        .badge-falha {{ background: var(--danger-light); color: var(--danger); border: 1px solid #fecaca; }}
-        .badge-loading {{ background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }}
-        .kpi-grid {{
+        }
+        .badge-ok { background: var(--primary-light); color: var(--primary-dark); border: 1px solid #a7f3d0; }
+        .badge-falha { background: var(--danger-light); color: var(--danger); border: 1px solid #fecaca; }
+        .badge-loading { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
+        .kpi-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 16px;
             margin-bottom: 24px;
-        }}
-        .kpi-card {{
+        }
+        .kpi-card {
             background: var(--surface-color);
             border: 1px solid var(--border-color);
             border-radius: 12px;
             padding: 18px 20px;
             box-shadow: 0 1px 2px rgba(0,0,0,0.02);
-        }}
-        .kpi-card .label {{ font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; }}
-        .kpi-card .value {{ font-size: 24px; font-weight: 800; font-family: 'JetBrains Mono', monospace; margin-top: 4px; }}
-        .kpi-card .subtext {{ font-size: 11px; color: var(--text-muted); margin-top: 4px; }}
-        .table-card {{
+        }
+        .kpi-card .label { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; }
+        .kpi-card .value { font-size: 24px; font-weight: 800; font-family: 'JetBrains Mono', monospace; margin-top: 4px; }
+        .kpi-card .subtext { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+        .table-card {
             background: var(--surface-color);
             border: 1px solid var(--border-color);
             border-radius: 16px;
             overflow: hidden;
             box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-        }}
-        .table-header {{
+        }
+        .table-header {
             padding: 16px 20px;
             border-bottom: 1px solid var(--border-color);
             display: flex;
             justify-content: space-between;
             align-items: center;
-        }}
-        .table-header h2 {{ font-size: 15px; font-weight: 700; }}
-        table {{ width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }}
-        th {{
+        }
+        .table-header h2 { font-size: 15px; font-weight: 700; }
+        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
+        th {
             background: #f8fafc;
             padding: 12px 18px;
             font-weight: 700;
@@ -604,22 +554,22 @@ def dashboard_logs_page(request: Request):
             text-transform: uppercase;
             color: var(--text-muted);
             border-bottom: 1px solid var(--border-color);
-        }}
-        td {{ padding: 14px 18px; border-bottom: 1px solid var(--border-color); color: #1e293b; }}
-        tr:hover td {{ background-color: #f8fafc; }}
-        .font-mono {{ font-family: 'JetBrains Mono', monospace; }}
-        .font-bold {{ font-weight: 700; }}
-        .text-right {{ text-align: right; }}
-        .text-center {{ text-align: center; }}
-        .text-muted {{ color: var(--text-muted); }}
-        .pill-category {{ background: #f1f5f9; color: #334155; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }}
-        .error-msg {{ font-size: 11px; color: var(--danger); margin-top: 4px; font-family: 'JetBrains Mono', monospace; }}
-        footer {{ margin-top: 24px; text-align: center; font-size: 12px; color: var(--text-muted); }}
+        }
+        td { padding: 14px 18px; border-bottom: 1px solid var(--border-color); color: #1e293b; }
+        tr:hover td { background-color: #f8fafc; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        .font-bold { font-weight: 700; }
+        .text-right { text-align: right; }
+        .text-center { text-align: center; }
+        .text-muted { color: var(--text-muted); }
+        .pill-category { background: #f1f5f9; color: #334155; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+        .error-msg { font-size: 11px; color: var(--danger); margin-top: 4px; font-family: 'JetBrains Mono', monospace; }
+        footer { margin-top: 24px; text-align: center; font-size: 12px; color: var(--text-muted); }
     </style>
 </head>
 <body>
     <div class="container">
-        {alert_box}
+        __ALERT_BOX__
 
         <header>
             <div class="title-group">
@@ -674,22 +624,22 @@ def dashboard_logs_page(request: Request):
         <div class="kpi-grid">
             <div class="kpi-card">
                 <div class="label">Gravados no Google Sheets</div>
-                <div class="value" style="color: var(--primary-dark);">{sucessos_sheets}</div>
+                <div class="value" style="color: var(--primary-dark);">__SUCESSOS_SHEETS__</div>
                 <div class="subtext">Sincronizados com sucesso</div>
             </div>
             <div class="kpi-card">
                 <div class="label">Falhas de Envio</div>
-                <div class="value" style="color: {'var(--danger)' if falhas_sheets > 0 else 'var(--text-muted)'};">{falhas_sheets}</div>
+                <div class="value" style="color: var(--danger);">__FALHAS_SHEETS__</div>
                 <div class="subtext">Erros detectados</div>
             </div>
             <div class="kpi-card">
                 <div class="label">Valor Total Registrado</div>
-                <div class="value">R$ {total_valor:.2f}</div>
+                <div class="value">R$ __TOTAL_VALOR__</div>
                 <div class="subtext">Soma das notas enviadas</div>
             </div>
             <div class="kpi-card">
                 <div class="label">Total Recebidos</div>
-                <div class="value">{total_recebidos}</div>
+                <div class="value">__TOTAL_RECEBIDOS__</div>
                 <div class="subtext">Mensagens via Telegram</div>
             </div>
         </div>
@@ -713,7 +663,7 @@ def dashboard_logs_page(request: Request):
                         </tr>
                     </thead>
                     <tbody>
-                        {rows_html}
+                        __ROWS_HTML__
                     </tbody>
                 </table>
             </div>
@@ -772,4 +722,66 @@ def dashboard_logs_page(request: Request):
 </body>
 </html>
 """
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard_logs_page(request: Request):
+    total_recebidos = len(processing_logs)
+    sucessos_sheets = sum(1 for log in processing_logs if log.get("status_sheets") == "Enviado com Sucesso")
+    falhas_sheets = sum(1 for log in processing_logs if "Falha" in log.get("status_sheets", "") or "Erro" in log.get("status_sheets", ""))
+    total_valor = sum(log.get("valor", 0.0) for log in processing_logs if log.get("status_sheets") == "Enviado com Sucesso")
+
+    alert_box = ""
+    if request.query_params.get("msg") == "webhook_sucesso":
+        alert_box = (
+            '<div style="background: #ecfdf5; border: 1px solid #10b981; color: #065f46; '
+            'padding: 12px 18px; border-radius: 10px; margin-bottom: 20px; font-weight: 600; font-size: 13px;">'
+            '🎉 Webhook registrado com sucesso no Telegram! Agora seu bot já recebe mensagens e grava na planilha.'
+            '</div>'
+        )
+
+    rows_html = ""
+    if not processing_logs:
+        rows_html = """
+        <tr>
+            <td colspan="7" class="empty-state">
+                <div style="padding: 40px 20px; text-align: center; color: #64748b;">
+                    <div style="font-size: 32px; margin-bottom: 8px;">📋</div>
+                    <div style="font-weight: 600; font-size: 15px; color: #334155;">Nenhum comprovante processado até o momento</div>
+                    <div style="font-size: 13px; margin-top: 4px;">Envie uma foto de nota fiscal no Telegram para ver o registro em tempo real.</div>
+                </div>
+            </td>
+        </tr>
+        """
+    else:
+        for log in processing_logs:
+            is_success = log.get("status_sheets") == "Enviado com Sucesso"
+            status_badge = (
+                '<span class="badge-status badge-ok">✓ Gravado no Sheets</span>'
+                if is_success
+                else f'<span class="badge-status badge-falha">✕ {log.get("status_sheets")}</span>'
+            )
+            erro_html = f'<div class="error-msg">{log.get("erro")}</div>' if log.get("erro") else ""
+
+            rows_html += f"""
+            <tr>
+                <td class="font-mono text-muted">{log.get("timestamp")}</td>
+                <td class="font-bold">{log.get("estabelecimento")}</td>
+                <td><span class="pill-category">{log.get("categoria")}</span></td>
+                <td>{log.get("tipo_documento")} / {log.get("pagamento")}</td>
+                <td class="font-mono font-bold text-right">R$ {log.get("valor", 0.0):.2f}</td>
+                <td class="text-center">{status_badge}{erro_html}</td>
+                <td class="text-muted font-mono">{log.get("username")} ({log.get("tipo_envio", "-")})</td>
+            </tr>
+            """
+
+    html_content = (
+        HTML_DASHBOARD_TEMPLATE
+        .replace("__ALERT_BOX__", alert_box)
+        .replace("__ROWS_HTML__", rows_html)
+        .replace("__SUCESSOS_SHEETS__", str(sucessos_sheets))
+        .replace("__FALHAS_SHEETS__", str(falhas_sheets))
+        .replace("__TOTAL_VALOR__", f"{total_valor:.2f}")
+        .replace("__TOTAL_RECEBIDOS__", str(total_recebidos))
+    )
+
     return HTMLResponse(content=html_content, status_code=200)
