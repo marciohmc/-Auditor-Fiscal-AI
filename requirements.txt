@@ -5,4 +5,3 @@ google-genai
 gspread
 google-auth
 requests
-Pillow
