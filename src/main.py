@@ -102,8 +102,9 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
     candidate_models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"]
     last_err = None
 
-    for model_name in candidate_models:
+    for attempt, model_name in enumerate(candidate_models, start=1):
         try:
+            logger.info(f"Tentando extração fiscal com modelo: {model_name} (tentativa {attempt})")
             response = genai_client.models.generate_content(
                 model=model_name,
                 contents=[
@@ -115,7 +116,7 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
                     response_mime_type="application/json"
                 )
             )
-            raw_text = response.text.strip()
+            raw_text = (response.text or "").strip()
             if raw_text.startswith("```json"):
                 raw_text = raw_text[7:]
             if raw_text.startswith("```"):
@@ -126,8 +127,16 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
             parsed = json.loads(raw_text.strip())
             return parsed
         except Exception as err:
-            logger.warning(f"Tentativa com modelo {model_name} falhou: {err}")
+            err_str = str(err)
+            logger.warning(f"Tentativa com modelo {model_name} falhou: {err_str}")
             last_err = err
+            # Backoff adaptativo se for 503 / alta demanda
+            if "503" in err_str or "UNAVAILABLE" in err_str or "demand" in err_str:
+                import time
+                time.sleep(1.8 * attempt)
+            else:
+                import time
+                time.sleep(0.6)
 
     raise last_err or RuntimeError("Falha ao analisar imagem com Gemini AI.")
 
@@ -350,8 +359,15 @@ async def telegram_webhook(request: Request):
             except Exception as e_gemini:
                 log_entry["status_gemini"] = "Falha"
                 log_entry["status_sheets"] = "Cancelado"
-                log_entry["erro"] = f"Erro no Gemini: {str(e_gemini)}"
-                send_telegram_message(chat_id, f"⚠️ Erro ao analisar comprovante fiscal: {str(e_gemini)}", message_id)
+                err_msg = str(e_gemini)
+                log_entry["erro"] = err_msg
+
+                if "503" in err_msg or "UNAVAILABLE" in err_msg or "demand" in err_msg:
+                    user_friendly_msg = "⏳ Os servidores de IA do Google estão momentaneamente com alta demanda. Por favor, reenvie a foto em 30 segundos."
+                else:
+                    user_friendly_msg = f"⚠️ Erro ao analisar comprovante fiscal: {err_msg}"
+
+                send_telegram_message(chat_id, user_friendly_msg, message_id)
                 processing_logs.insert(0, log_entry)
                 return Response(status_code=status.HTTP_200_OK)
 
@@ -397,6 +413,7 @@ def get_logs_json():
         "logs": processing_logs
     }
 
+# Template HTML estático (NÃO usa f-string para evitar conflito com chaves do CSS e JS)
 HTML_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
