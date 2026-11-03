@@ -68,6 +68,8 @@ def download_telegram_file(file_id: str) -> bytes:
     file_res = requests.get(download_url, timeout=30)
     return file_res.content
 
+import time
+
 def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
     system_instruction = (
         "Você é um assistente especialista em auditoria financeira e extração de dados de comprovantes fiscais. "
@@ -91,38 +93,51 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
         "4. Não inclua texto, explicação ou marcações markdown (como ```json) fora do objeto JSON."
     )
 
-    # Suporte a modelos ativos no SDK oficial google-genai
-    candidate_models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"]
+    # Modelos estáveis com rotação automática
+    candidate_models = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-3.8-flash", "gemini-2.0-flash"]
     last_err = None
 
     for model_name in candidate_models:
-        try:
-            response = genai_client.models.generate_content(
-                model=model_name,
-                contents=[
-                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                    user_prompt
-                ],
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json"
+        for attempt in range(1, 4):
+            try:
+                logger.info(f"Tentativa {attempt}/3 com modelo {model_name}...")
+                response = genai_client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                        user_prompt
+                    ],
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json"
+                    )
                 )
-            )
-            raw_text = response.text.strip()
-            if raw_text.startswith("```json"):
-                raw_text = raw_text[7:]
-            if raw_text.startswith("```"):
-                raw_text = raw_text[3:]
-            if raw_text.endswith("```"):
-                raw_text = raw_text[:-3]
+                raw_text = response.text.strip()
+                if raw_text.startswith("```json"):
+                    raw_text = raw_text[7:]
+                if raw_text.startswith("```"):
+                    raw_text = raw_text[3:]
+                if raw_text.endswith("```"):
+                    raw_text = raw_text[:-3]
 
-            parsed = json.loads(raw_text.strip())
-            return parsed
-        except Exception as err:
-            logger.warning(f"Tentativa com modelo {model_name} falhou: {err}")
-            last_err = err
+                parsed = json.loads(raw_text.strip())
+                logger.info(f"Extração bem sucedida com {model_name} na tentativa {attempt}")
+                return parsed
+            except Exception as err:
+                err_str = str(err)
+                last_err = err
+                logger.warning(f"Tentativa {attempt} com {model_name} falhou: {err_str}")
+                
+                # Se for erro 503 UNAVAILABLE ou 429, aguarda antes da próxima tentativa
+                if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str or "429" in err_str:
+                    wait_time = attempt * 2.0
+                    logger.info(f"Alta demanda temporária da Google detectada. Aguardando {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    # Erro permanente no modelo, troca logo para o próximo
+                    break
 
-    raise last_err or RuntimeError("Falha ao analisar imagem com Gemini AI.")
+    raise last_err or RuntimeError("Falha ao analisar imagem com Gemini AI após múltiplas tentativas.")
 
 def append_to_sheet(data: Dict[str, Any]) -> int:
     if not SPREADSHEET_ID:
@@ -196,10 +211,21 @@ async def telegram_webhook(request: Request):
                 log_entry["valor"] = float(extracted_data.get("valor", 0.0))
                 log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
             except Exception as e_gemini:
+                err_str = str(e_gemini)
                 log_entry["status_gemini"] = "Falha"
                 log_entry["status_sheets"] = "Cancelado (Erro Gemini)"
-                log_entry["erro"] = f"Erro no Gemini: {str(e_gemini)}"
-                send_telegram_message(chat_id, f"⚠️ Erro ao analisar comprovante fiscal: {str(e_gemini)}", message_id)
+                log_entry["erro"] = f"Erro no Gemini: {err_str}"
+
+                if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
+                    friendly_error = (
+                        "⏳ *Servidores do Google com Alta Demanda Temporária*\n\n"
+                        "A API do Gemini está momentaneamente sobrecarregada (Status 503).\n"
+                        "Por favor, aguarde 15 a 30 segundos e **envie a foto novamente**."
+                    )
+                else:
+                    friendly_error = f"⚠️ Não foi possível analisar o comprovante: {err_str}"
+
+                send_telegram_message(chat_id, friendly_error, message_id)
                 processing_logs.insert(0, log_entry)
                 return Response(status_code=status.HTTP_200_OK)
 
