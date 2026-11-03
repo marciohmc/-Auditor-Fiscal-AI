@@ -220,9 +220,20 @@ requests==2.32.3`;
               Integração completa que recebe fotos de comprovantes no Telegram, executa a extração contábil via Gemini AI e grava a linha formatada no Google Sheets.
             </p>
           </div>
-          <div className="flex items-center gap-2 text-xs font-mono bg-slate-50 border border-slate-200 px-3 py-2 rounded-lg text-slate-600 shrink-0">
-            <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
-            <span>Endpoint: /webhook (Ativo)</span>
+          <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2">
+            <a
+              href="https://bot-financeiro-telegram-daqm.onrender.com/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1.5 text-xs font-semibold bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 px-3 py-2 rounded-lg transition-colors shadow-2xs"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              <span>Abrir Monitor Render (Logs em Tempo Real)</span>
+            </a>
+            <div className="flex items-center gap-2 text-xs font-mono bg-slate-50 border border-slate-200 px-3 py-2 rounded-lg text-slate-600 shrink-0">
+              <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+              <span>Endpoint: /webhook (Ativo)</span>
+            </div>
           </div>
         </div>
       </div>
