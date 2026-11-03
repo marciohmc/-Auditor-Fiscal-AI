@@ -1,10 +1,12 @@
 import os
+import io
 import json
+import time
 import logging
 from datetime import datetime
 from typing import Dict, Any, List
 
-from fastapi import FastAPI, Request, Response, status
+from fastapi import FastAPI, Request, Response, status, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import requests
 import gspread
@@ -73,9 +75,37 @@ def download_telegram_file(file_id: str) -> bytes:
     file_res = requests.get(download_url, timeout=25)
     return file_res.content
 
-def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
+def optimize_receipt_image(image_bytes: bytes) -> bytes:
+    """
+    Otimiza a imagem do comprovante fiscal (Melhoria 3):
+    - Corrige orientacao EXIF de fotos de smartphone (evita fotos de lado/invertidas)
+    - Reduz dimensoes para max 1600px mantendo a proporcao
+    - Comprime em JPEG qualidade 85% para reduzir arquivos pesados de 8MB para ~200-300KB
+    """
+    try:
+        from PIL import Image, ImageOps
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            max_dimension = 1600
+            if max(img.width, img.height) > max_dimension:
+                img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85, optimize=True)
+            optimized_bytes = buf.getvalue()
+            logger.info(f"Otimizacao de imagem: {len(image_bytes)/1024:.1f} KB -> {len(optimized_bytes)/1024:.1f} KB")
+            return optimized_bytes
+    except Exception as e:
+        logger.warning(f"Otimizacao Pillow ignorada/indisponivel ({e}). Usando imagem original.")
+        return image_bytes
+
+def analyze_receipt(image_bytes: bytes, max_rounds: int = 3) -> Dict[str, Any]:
     if not genai_client:
         raise RuntimeError("GEMINI_API_KEY não configurada ou cliente não inicializado.")
+
+    # Melhoria 3: Otimiza e comprime imagem
+    processed_bytes = optimize_receipt_image(image_bytes)
 
     system_instruction = (
         "Você é um assistente especialista em auditoria financeira e extração de dados de comprovantes fiscais. "
@@ -99,46 +129,59 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
         "4. Não inclua texto, explicação ou marcações markdown (como ```json) fora do objeto JSON."
     )
 
-    candidate_models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"]
+    # Melhoria 4: Incluindo modelos Lite e alternativas rapidas com menor latencia
+    candidate_models = [
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash-8b",
+        "gemini-3.8-flash",
+        "gemini-flash-latest"
+    ]
     last_err = None
 
-    for attempt, model_name in enumerate(candidate_models, start=1):
-        try:
-            logger.info(f"Tentando extração fiscal com modelo: {model_name} (tentativa {attempt})")
-            response = genai_client.models.generate_content(
-                model=model_name,
-                contents=[
-                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                    user_prompt
-                ],
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json"
+    for round_num in range(1, max_rounds + 1):
+        for model_idx, model_name in enumerate(candidate_models, start=1):
+            try:
+                logger.info(f"Tentando extração fiscal com {model_name} (rodada {round_num}/{max_rounds}, candidato {model_idx})")
+                response = genai_client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        types.Part.from_bytes(data=processed_bytes, mime_type="image/jpeg"),
+                        user_prompt
+                    ],
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json"
+                    )
                 )
-            )
-            raw_text = (response.text or "").strip()
-            if raw_text.startswith("```json"):
-                raw_text = raw_text[7:]
-            if raw_text.startswith("```"):
-                raw_text = raw_text[3:]
-            if raw_text.endswith("```"):
-                raw_text = raw_text[:-3]
+                raw_text = (response.text or "").strip()
+                if raw_text.startswith("```json"):
+                    raw_text = raw_text[7:]
+                if raw_text.startswith("```"):
+                    raw_text = raw_text[3:]
+                if raw_text.endswith("```"):
+                    raw_text = raw_text[:-3]
 
-            parsed = json.loads(raw_text.strip())
-            return parsed
-        except Exception as err:
-            err_str = str(err)
-            logger.warning(f"Tentativa com modelo {model_name} falhou: {err_str}")
-            last_err = err
-            # Backoff adaptativo se for 503 / alta demanda
-            if "503" in err_str or "UNAVAILABLE" in err_str or "demand" in err_str:
-                import time
-                time.sleep(1.8 * attempt)
-            else:
-                import time
-                time.sleep(0.6)
+                parsed = json.loads(raw_text.strip())
+                logger.info(f"Extração concluída com sucesso usando {model_name}")
+                return parsed
+            except Exception as err:
+                err_str = str(err)
+                logger.warning(f"Tentativa com modelo {model_name} falhou: {err_str}")
+                last_err = err
+                # Backoff adaptativo se for 503 / alta demanda
+                if "503" in err_str or "UNAVAILABLE" in err_str or "demand" in err_str:
+                    time.sleep(1.5 * round_num)
+                else:
+                    time.sleep(0.4)
 
-    raise last_err or RuntimeError("Falha ao analisar imagem com Gemini AI.")
+        if round_num < max_rounds:
+            pause_time = round_num * 2.5
+            logger.info(f"Modelos sobrecarregados na rodada {round_num}. Aguardando {pause_time}s antes de re-tentar...")
+            time.sleep(pause_time)
+
+    raise last_err or RuntimeError("Falha ao analisar imagem com Gemini AI após múltiplas tentativas.")
 
 def append_to_sheet(data: Dict[str, Any]) -> int:
     if not SPREADSHEET_ID:
@@ -294,8 +337,76 @@ def register_telegram_webhook():
     except Exception as e:
         return HTMLResponse(f"<h3>Erro de conexão:</h3><pre>{str(e)}</pre>", status_code=500)
 
+def process_receipt_background(file_id: str, chat_id: int, chat_user: str, message_id: int, log_entry: Dict[str, Any]):
+    """
+    Processamento em segundo plano (Melhoria 2):
+    - Baixa o arquivo do Telegram
+    - Comprime e otimiza a imagem (Melhoria 3)
+    - Executa analise com modelos Flash/Lite e retentativas automaticas (Melhoria 4)
+    - Grava na planilha do Google Sheets
+    - Notifica o usuario no Telegram com o resultado final
+    """
+    try:
+        img_bytes = download_telegram_file(file_id)
+        extracted_data = analyze_receipt(img_bytes)
+
+        log_entry["status_gemini"] = "Sucesso"
+        log_entry["estabelecimento"] = extracted_data.get("estabelecimento", "Não Informado")
+        log_entry["tipo_documento"] = extracted_data.get("tipo_documento", "Não Informado")
+        log_entry["categoria"] = extracted_data.get("categoria", "Não Informado")
+        log_entry["pagamento"] = extracted_data.get("pagamento", "Não Informado")
+        log_entry["valor"] = float(extracted_data.get("valor", 0.0))
+        log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
+
+        try:
+            append_to_sheet(extracted_data)
+            log_entry["status_sheets"] = "Enviado com Sucesso"
+            log_entry["detalhes"] += " | Gravado na Planilha"
+        except Exception as e_sheets:
+            log_entry["status_sheets"] = "Falha no Envio"
+            log_entry["erro"] = f"Erro Google Sheets: {str(e_sheets)}"
+            logger.error(f"Erro ao salvar na planilha Google: {e_sheets}")
+            send_telegram_message(
+                chat_id,
+                f"⚠️ *Dados extraídos*, porém falhou ao gravar na planilha:\n`{str(e_sheets)}`",
+                message_id
+            )
+            processing_logs.insert(0, log_entry)
+            return
+
+        success_msg = (
+            "✅ *Lançamento Registrado com Sucesso!*\n\n"
+            f"• *Data:* {extracted_data.get('data')}\n"
+            f"• *Estabelecimento:* {extracted_data.get('estabelecimento')}\n"
+            f"• *Documento:* {extracted_data.get('tipo_documento')}\n"
+            f"• *Categoria:* {extracted_data.get('categoria')}\n"
+            f"• *Pagamento:* {extracted_data.get('pagamento')}\n"
+            f"• *Valor:* R$ {float(extracted_data.get('valor', 0)):.2f}\n\n"
+            "📊 *Gravado na Planilha do Google Sheets!*"
+        )
+        send_telegram_message(chat_id, success_msg, message_id)
+        processing_logs.insert(0, log_entry)
+
+    except Exception as e_proc:
+        err_msg = str(e_proc)
+        logger.error(f"Falha no processamento em segundo plano: {err_msg}")
+        log_entry["status_gemini"] = "Falha"
+        log_entry["status_sheets"] = "Cancelado"
+        log_entry["erro"] = err_msg
+
+        if "503" in err_msg or "UNAVAILABLE" in err_msg or "demand" in err_msg:
+            user_msg = (
+                "⏳ Os servidores de IA do Google estão enfrentando alta demanda atípica no momento "
+                "(mesmo após retentativas automáticas). Por favor, reenvie a foto em 1 minuto."
+            )
+        else:
+            user_msg = f"⚠️ Erro ao analisar comprovante fiscal: {err_msg}"
+
+        send_telegram_message(chat_id, user_msg, message_id)
+        processing_logs.insert(0, log_entry)
+
 @app.post("/webhook")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     timestamp_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     log_entry: Dict[str, Any] = {
         "id": f"log-{int(datetime.now().timestamp() * 1000)}",
@@ -303,7 +414,7 @@ async def telegram_webhook(request: Request):
         "chat_id": "Desconhecido",
         "username": "Desconhecido",
         "tipo_envio": "Desconhecido",
-        "status_gemini": "Pendente",
+        "status_gemini": "Em Processamento",
         "status_sheets": "Pendente",
         "estabelecimento": "-",
         "tipo_documento": "-",
@@ -344,58 +455,30 @@ async def telegram_webhook(request: Request):
                 return Response(status_code=status.HTTP_200_OK)
 
         if file_id:
-            send_telegram_message(chat_id, "🔍 Processando comprovante fiscal com Gemini...", message_id)
-
-            try:
-                img_bytes = download_telegram_file(file_id)
-                extracted_data = analyze_receipt(img_bytes)
-                log_entry["status_gemini"] = "Sucesso"
-                log_entry["estabelecimento"] = extracted_data.get("estabelecimento", "Não Informado")
-                log_entry["tipo_documento"] = extracted_data.get("tipo_documento", "Não Informado")
-                log_entry["categoria"] = extracted_data.get("categoria", "Não Informado")
-                log_entry["pagamento"] = extracted_data.get("pagamento", "Não Informado")
-                log_entry["valor"] = float(extracted_data.get("valor", 0.0))
-                log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
-            except Exception as e_gemini:
-                log_entry["status_gemini"] = "Falha"
-                log_entry["status_sheets"] = "Cancelado"
-                err_msg = str(e_gemini)
-                log_entry["erro"] = err_msg
-
-                if "503" in err_msg or "UNAVAILABLE" in err_msg or "demand" in err_msg:
-                    user_friendly_msg = "⏳ Os servidores de IA do Google estão momentaneamente com alta demanda. Por favor, reenvie a foto em 30 segundos."
-                else:
-                    user_friendly_msg = f"⚠️ Erro ao analisar comprovante fiscal: {err_msg}"
-
-                send_telegram_message(chat_id, user_friendly_msg, message_id)
-                processing_logs.insert(0, log_entry)
-                return Response(status_code=status.HTTP_200_OK)
-
-            try:
-                append_to_sheet(extracted_data)
-                log_entry["status_sheets"] = "Enviado com Sucesso"
-                log_entry["detalhes"] += " | Gravado na Planilha"
-            except Exception as e_sheets:
-                log_entry["status_sheets"] = "Falha no Envio"
-                log_entry["erro"] = f"Erro Google Sheets: {str(e_sheets)}"
-                logger.error(f"Erro ao salvar na planilha Google: {e_sheets}")
-                send_telegram_message(chat_id, f"⚠️ Dados extraídos, mas falhou ao gravar no Google Sheets: {str(e_sheets)}", message_id)
-                processing_logs.insert(0, log_entry)
-                return Response(status_code=status.HTTP_200_OK)
-
-            success_msg = (
-                "✅ *Lançamento Registrado com Sucesso!*\n\n"
-                f"• *Data:* {extracted_data.get('data')}\n"
-                f"• *Estabelecimento:* {extracted_data.get('estabelecimento')}\n"
-                f"• *Documento:* {extracted_data.get('tipo_documento')}\n"
-                f"• *Categoria:* {extracted_data.get('categoria')}\n"
-                f"• *Pagamento:* {extracted_data.get('pagamento')}\n"
-                f"• *Valor:* R$ {float(extracted_data.get('valor', 0)):.2f}\n\n"
-                "📊 *Gravado na Planilha do Google Sheets!*"
+            # Resposta imediata de confirmacao de recebimento no Telegram
+            send_telegram_message(
+                chat_id,
+                "🔍 *Comprovante recebido!* Otimizando imagem e analisando com Gemini em segundo plano...",
+                message_id
             )
-            send_telegram_message(chat_id, success_msg, message_id)
-            processing_logs.insert(0, log_entry)
+            # Executa analise, retentativas e gravacao em background sem risco de timeout do webhook
+            background_tasks.add_task(
+                process_receipt_background,
+                file_id,
+                chat_id,
+                chat_user,
+                message_id,
+                log_entry
+            )
+            return Response(status_code=status.HTTP_200_OK)
 
+        return Response(status_code=status.HTTP_200_OK)
+
+    except Exception as e:
+        logger.error(f"Erro geral no webhook: {str(e)}", exc_info=True)
+        log_entry["erro"] = str(e)
+        log_entry["status_sheets"] = "Erro Geral"
+        processing_logs.insert(0, log_entry)
         return Response(status_code=status.HTTP_200_OK)
 
     except Exception as e:
