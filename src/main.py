@@ -93,8 +93,8 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
         "4. Não inclua texto, explicação ou marcações markdown (como ```json) fora do objeto JSON."
     )
 
-    # Modelos estáveis com rotação automática
-    candidate_models = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-3.8-flash", "gemini-2.0-flash"]
+    # Apenas modelos ativos e recomendados pela Google AI API
+    candidate_models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"]
     last_err = None
 
     for model_name in candidate_models:
@@ -127,6 +127,11 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
                 err_str = str(err)
                 last_err = err
                 logger.warning(f"Tentativa {attempt} com {model_name} falhou: {err_str}")
+
+                # Se o modelo não existir ou for descontinuado (404), pula imediatamente para o próximo
+                if "404" in err_str or "NOTFOUND" in err_str or "no longer available" in err_str:
+                    logger.info(f"Modelo {model_name} descontinuado ou não encontrado. Pulando para o próximo...")
+                    break
                 
                 # Se for erro 503 UNAVAILABLE ou 429, aguarda antes da próxima tentativa
                 if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str or "429" in err_str:
@@ -134,7 +139,6 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
                     logger.info(f"Alta demanda temporária da Google detectada. Aguardando {wait_time}s...")
                     time.sleep(wait_time)
                 else:
-                    # Erro permanente no modelo, troca logo para o próximo
                     break
 
     raise last_err or RuntimeError("Falha ao analisar imagem com Gemini AI após múltiplas tentativas.")
