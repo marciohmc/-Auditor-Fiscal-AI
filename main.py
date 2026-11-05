@@ -160,6 +160,79 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
 
     raise last_err or RuntimeError("Falha ao analisar imagem com Gemini AI após múltiplas tentativas.")
 
+def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> bool:
+    """
+    Verifica se os dados extraídos já existem nos últimos registros da planilha
+    ou no histórico recente de processamento.
+    Retorna True se for duplicado e False se for um lançamento novo.
+    """
+    data_nova = str(dados_extraidos.get("data", "")).strip()
+    estab_novo = str(dados_extraidos.get("estabelecimento", "")).strip().lower()
+    valor_novo = float(dados_extraidos.get("valor", 0.0))
+
+    # 1. Checagem em memória no histórico recente
+    for log in processing_logs[:limite_registros]:
+        if log.get("status_sheets") == "Enviado com Sucesso":
+            e_antigo = str(log.get("estabelecimento", "")).strip().lower()
+            v_antigo = float(log.get("valor", 0.0))
+            d_antiga = str(log.get("data_comprovante", "")).strip()
+            try:
+                if log.get("detalhes") and not d_antiga:
+                    det_json = json.loads(log["detalhes"].split(" | ")[0])
+                    d_antiga = str(det_json.get("data", "")).strip()
+            except Exception:
+                pass
+
+            if (data_nova == d_antiga and 
+                estab_novo == e_antigo and 
+                abs(valor_novo - v_antigo) < 0.01):
+                logger.info(f"Duplicidade detectada no cache local: {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
+                return True
+
+    # 2. Checagem direta na planilha do Google Sheets
+    if SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON:
+        try:
+            gc = get_sheets_client()
+            sh = gc.open_by_key(SPREADSHEET_ID)
+            worksheet = sh.get_worksheet(0)
+            
+            # Busca todas as linhas registradas na planilha
+            todas_linhas = worksheet.get_all_values()
+            
+            # Se a planilha tiver apenas o cabeçalho ou estiver vazia, não há duplicados
+            if len(todas_linhas) <= 1:
+                return False
+            
+            # Analisa apenas as últimas 'limite_registros' linhas para economizar memória/processamento
+            ultimas_linhas = todas_linhas[-limite_registros:]
+            
+            for linha in ultimas_linhas:
+                # Ordem das colunas: [Data, Estabelecimento, Documento, Categoria, Pagamento, Valor]
+                if len(linha) >= 6:
+                    data_existente = str(linha[0]).strip()
+                    estab_existente = str(linha[1]).strip().lower()
+                    try:
+                        valor_existente = float(
+                            str(linha[5])
+                            .replace("R$", "")
+                            .replace(" ", "")
+                            .replace(",", ".")
+                            .strip()
+                        )
+                    except ValueError:
+                        valor_existente = 0.0
+                    
+                    # Comparação dos 3 critérios fundamentais: Data, Estabelecimento e Valor
+                    if (data_nova == data_existente and 
+                        estab_novo == estab_existente and 
+                        abs(valor_novo - valor_existente) < 0.01):
+                        logger.info(f"Duplicidade detectada na planilha: {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
+                        return True
+        except Exception as e_dup:
+            logger.warning(f"Aviso ao consultar duplicidade no Google Sheets: {e_dup}")
+            
+    return False
+
 def append_to_sheet(data: Dict[str, Any]) -> int:
     if not SPREADSHEET_ID:
         raise ValueError("SPREADSHEET_ID não configurada nas variáveis de ambiente.")
@@ -225,7 +298,7 @@ async def telegram_webhook(request: Request):
                 img_bytes = download_telegram_file(file_id)
                 extracted_data = analyze_receipt(img_bytes)
 
-                # Verificação do status de leitura (se ilegível, notifica e não grava na planilha)
+                # 2. Verificação do status de leitura (se ilegível, notifica e não grava na planilha)
                 if extracted_data.get("status_leitura") == "ilegivel":
                     mensagem_usuario = extracted_data.get(
                         "mensagem_erro",
@@ -245,7 +318,23 @@ async def telegram_webhook(request: Request):
                 log_entry["categoria"] = extracted_data.get("categoria", "Não Informado")
                 log_entry["pagamento"] = extracted_data.get("pagamento", "Não Informado")
                 log_entry["valor"] = float(extracted_data.get("valor", 0.0))
+                log_entry["data_comprovante"] = extracted_data.get("data", "")
                 log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
+
+                # 3. Verificação de Duplicidade antes de gravar na planilha
+                if verificar_duplicidade(extracted_data):
+                    alerta_duplicado = (
+                        "⚠️ *Atenção: Comprovante Duplicado Detectado!*\n\n"
+                        f"Já existe um registro recente para *{extracted_data.get('estabelecimento')}* "
+                        f"no valor de *R$ {float(extracted_data.get('valor', 0)):.2f}* na data *{extracted_data.get('data')}*.\n\n"
+                        "O lançamento foi ignorado para evitar duplicidade na planilha."
+                    )
+                    log_entry["status_sheets"] = "Ignorado (Duplicidade)"
+                    log_entry["erro"] = "Comprovante idêntico já cadastrado recentemente"
+                    send_telegram_message(chat_id, alerta_duplicado, message_id)
+                    processing_logs.insert(0, log_entry)
+                    return Response(status_code=status.HTTP_200_OK)
+
             except Exception as e_gemini:
                 err_str = str(e_gemini)
                 log_entry["status_gemini"] = "Falha"
@@ -341,11 +430,13 @@ def dashboard_logs_page():
     else:
         for log in processing_logs:
             is_success = log.get("status_sheets") == "Enviado com Sucesso"
-            status_badge = (
-                '<span class="badge badge-success">✓ Gravado na Planilha</span>'
-                if is_success
-                else f'<span class="badge badge-error">✕ {log.get("status_sheets")}</span>'
-            )
+            is_dup = "Duplicidade" in log.get("status_sheets", "") or "Ignorado" in log.get("status_sheets", "")
+            if is_success:
+                status_badge = '<span class="badge badge-success">✓ Gravado na Planilha</span>'
+            elif is_dup:
+                status_badge = '<span class="badge badge-warning">⚠️ Ignorado (Duplicado)</span>'
+            else:
+                status_badge = f'<span class="badge badge-error">✕ {log.get("status_sheets")}</span>'
 
             erro_html = f'<div class="error-msg">{log.get("erro")}</div>' if log.get("erro") else ""
 
@@ -569,6 +660,11 @@ def dashboard_logs_page():
             background: var(--danger-light);
             color: var(--danger);
             border: 1px solid #fecaca;
+        }}
+        .badge-warning {{
+            background: #fffbeb;
+            color: #b45309;
+            border: 1px solid #fde68a;
         }}
         .pill-category {{
             background: #f1f5f9;

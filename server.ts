@@ -471,6 +471,46 @@ app.post('/webhook', async (req: Request, res: Response) => {
         });
       }
 
+      // Verificação de duplicidade (Data, Estabelecimento e Valor)
+      const isDuplicado = fiscalEntries.slice(0, 20).some((entry) => {
+        const dataNova = (parsed.data || '').trim();
+        const dataExistente = (entry.data || '').trim();
+        const estabNovo = (parsed.estabelecimento || '').trim().toLowerCase();
+        const estabExistente = (entry.estabelecimento || '').trim().toLowerCase();
+        const valorNovo = Number(parsed.valor) || 0;
+        const valorExistente = Number(entry.valor) || 0;
+
+        return (
+          dataNova === dataExistente &&
+          estabNovo === estabExistente &&
+          Math.abs(valorNovo - valorExistente) < 0.01
+        );
+      });
+
+      if (isDuplicado) {
+        const alertaDuplicado =
+          `⚠️ *Atenção: Comprovante Duplicado Detectado!*\n\n` +
+          `Já existe um registro recente para *${parsed.estabelecimento}* no valor de *R$ ${Number(parsed.valor).toFixed(2)}* na data *${parsed.data}*.\n\n` +
+          `O lançamento foi ignorado para evitar duplicidade na planilha.`;
+
+        webhookLogs.unshift({
+          id: logId,
+          timestamp: new Date().toISOString(),
+          chat_id: chatId,
+          origem: 'Telegram Webhook',
+          payload_summary: `Ignorado (Duplicado): ${parsed.estabelecimento} - R$ ${parsed.valor.toFixed(2)}`,
+          status: 'erro',
+          extracted_data: parsed,
+          error_message: 'Comprovante idêntico já cadastrado recentemente',
+        });
+
+        return res.status(200).json({
+          status: 'ok',
+          telegram_reply: alertaDuplicado,
+          is_duplicado: true,
+        });
+      }
+
       // Create new fiscal entry matching user's append_to_sheet pipeline
       const newEntry: StoredFiscalEntry = {
         id: 'doc-' + Date.now(),
