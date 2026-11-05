@@ -416,11 +416,28 @@ app.post('/api/extract', async (req: Request, res: Response) => {
   }
 });
 
+// Telegram Deduplication Set for Webhook updates
+const processedUpdateIds = new Set<number>();
+
 // Telegram Webhook Endpoint (compatible with user's Python FastAPI Telegram Webhook)
 app.post('/webhook', async (req: Request, res: Response) => {
   const logId = 'log-' + Date.now();
   try {
     const update = req.body;
+    const updateId = update?.update_id;
+
+    if (updateId) {
+      if (processedUpdateIds.has(updateId)) {
+        console.log(`Update ${updateId} duplicado ignorado.`);
+        return res.status(200).json({ status: 'ignored_duplicate_update', update_id: updateId });
+      }
+      processedUpdateIds.add(updateId);
+      if (processedUpdateIds.size > 1000) {
+        const first = processedUpdateIds.values().next().value;
+        if (first !== undefined) processedUpdateIds.delete(first);
+      }
+    }
+
     const message = update?.message || update?.channel_post;
 
     if (!message) {

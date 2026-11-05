@@ -1,10 +1,13 @@
 import os
 import json
 import logging
+import time
+import threading
+from collections import OrderedDict
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Set
 
-from fastapi import FastAPI, Request, Response, status
+from fastapi import FastAPI, Request, Response, BackgroundTasks, status
 from fastapi.responses import HTMLResponse, JSONResponse
 import requests
 import gspread
@@ -32,6 +35,11 @@ genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # Armazenamento em memória dos logs de processamento e envio
 processing_logs: List[Dict[str, Any]] = []
+
+# Mecanismos de Prevenção de Duplicidade e Controle de Concorrência
+processed_update_ids: OrderedDict[int, float] = OrderedDict()  # update_id -> timestamp
+in_progress_locks: Set[str] = set()                            # lock_key ("chat_id:message_id:file_id")
+sheets_write_lock = threading.Lock()                          # Trava exclusiva para leitura e escrita na planilha
 
 def get_sheets_client():
     scopes = [
@@ -67,8 +75,6 @@ def download_telegram_file(file_id: str) -> bytes:
     download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
     file_res = requests.get(download_url, timeout=30)
     return file_res.content
-
-import time
 
 def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
     system_instruction = (
@@ -162,31 +168,32 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
 
 def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> bool:
     """
-    Verifica se os dados extraídos já existem nos últimos registros da planilha
-    ou no histórico recente de processamento.
+    Verifica se os dados extraídos já existem nos registros recentes ou na planilha do Google Sheets.
     Retorna True se for duplicado e False se for um lançamento novo.
     """
     data_nova = str(dados_extraidos.get("data", "")).strip()
     estab_novo = str(dados_extraidos.get("estabelecimento", "")).strip().lower()
     valor_novo = float(dados_extraidos.get("valor", 0.0))
 
-    # 1. Checagem em memória no histórico recente
+    # 1. Checagem em memória no histórico recente de logs (evita concorrência e gravações simultâneas)
     for log in processing_logs[:limite_registros]:
-        if log.get("status_sheets") == "Enviado com Sucesso":
+        st = log.get("status_sheets", "")
+        # Considera registros já enviados com sucesso ou que estão em fase de gravação
+        if st in ("Enviado com Sucesso", "Gravando na Planilha...", "Processando"):
             e_antigo = str(log.get("estabelecimento", "")).strip().lower()
             v_antigo = float(log.get("valor", 0.0))
             d_antiga = str(log.get("data_comprovante", "")).strip()
-            try:
-                if log.get("detalhes") and not d_antiga:
+            if not d_antiga and log.get("detalhes"):
+                try:
                     det_json = json.loads(log["detalhes"].split(" | ")[0])
                     d_antiga = str(det_json.get("data", "")).strip()
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
             if (data_nova == d_antiga and 
                 estab_novo == e_antigo and 
                 abs(valor_novo - v_antigo) < 0.01):
-                logger.info(f"Duplicidade detectada no cache local: {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
+                logger.info(f"Duplicidade detectada no cache local em memória: {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
                 return True
 
     # 2. Checagem direta na planilha do Google Sheets
@@ -226,7 +233,7 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
                     if (data_nova == data_existente and 
                         estab_novo == estab_existente and 
                         abs(valor_novo - valor_existente) < 0.01):
-                        logger.info(f"Duplicidade detectada na planilha: {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
+                        logger.info(f"Duplicidade detectada no Google Sheets: {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
                         return True
         except Exception as e_dup:
             logger.warning(f"Aviso ao consultar duplicidade no Google Sheets: {e_dup}")
@@ -249,19 +256,22 @@ def append_to_sheet(data: Dict[str, Any]) -> int:
         str(data.get("pagamento", "Não Informado")),
         float(data.get("valor", 0.0))
     ]
-    res = worksheet.append_row(row)
-    # Retorna número de linhas atualizado se disponível
+    worksheet.append_row(row)
     return len(worksheet.get_all_values())
 
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
+def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, file_id: str, lock_key: str):
+    """
+    Executado em segundo plano (BackgroundTasks).
+    Isso permite que o endpoint /webhook responda HTTP 200 ao Telegram em milissegundos,
+    eliminando retentativas de timeout enviadas pelo Telegram.
+    """
     timestamp_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     log_entry: Dict[str, Any] = {
         "id": f"log-{int(datetime.now().timestamp() * 1000)}",
         "timestamp": timestamp_str,
-        "chat_id": "Desconhecido",
-        "username": "Desconhecido",
-        "status_gemini": "Pendente",
+        "chat_id": str(chat_id),
+        "username": str(chat_user),
+        "status_gemini": "Processando",
         "status_sheets": "Pendente",
         "estabelecimento": "-",
         "tipo_documento": "-",
@@ -271,90 +281,76 @@ async def telegram_webhook(request: Request):
         "erro": None,
         "detalhes": ""
     }
+    processing_logs.insert(0, log_entry)
 
     try:
-        update = await request.json()
-        message = update.get("message") or update.get("channel_post")
-        
-        if not message:
-            return Response(status_code=status.HTTP_200_OK)
+        # 1. Envia aviso inicial ao usuário
+        send_telegram_message(chat_id, "🔍 Processando comprovante fiscal com Gemini...", message_id)
 
-        chat_id = message["chat"]["id"]
-        chat_user = message.get("from", {}).get("username") or message.get("from", {}).get("first_name") or f"ID: {chat_id}"
-        message_id = message["message_id"]
+        # 2. Download e Análise com Gemini
+        try:
+            img_bytes = download_telegram_file(file_id)
+            extracted_data = analyze_receipt(img_bytes)
 
-        log_entry["chat_id"] = str(chat_id)
-        log_entry["username"] = str(chat_user)
-
-        # Processar apenas mensagens contendo fotos
-        if "photo" in message:
-            largest_photo = message["photo"][-1]
-            file_id = largest_photo["file_id"]
-
-            send_telegram_message(chat_id, "🔍 Processando comprovante fiscal com Gemini...", message_id)
-
-            # 1. Download e Análise com Gemini
-            try:
-                img_bytes = download_telegram_file(file_id)
-                extracted_data = analyze_receipt(img_bytes)
-
-                # 2. Verificação do status de leitura (se ilegível, notifica e não grava na planilha)
-                if extracted_data.get("status_leitura") == "ilegivel":
-                    mensagem_usuario = extracted_data.get(
-                        "mensagem_erro",
-                        "Não consegui ler os dados com clareza pois a imagem está borrada ou muito escura. Poderia enviar uma foto mais nítida, por favor?"
-                    )
-                    log_entry["status_gemini"] = "Ilegível"
-                    log_entry["status_sheets"] = "Não Enviado (Imagem Ilegível)"
-                    log_entry["erro"] = mensagem_usuario
-                    log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
-                    send_telegram_message(chat_id, f"⚠️ {mensagem_usuario}", message_id)
-                    processing_logs.insert(0, log_entry)
-                    return Response(status_code=status.HTTP_200_OK)
-
-                log_entry["status_gemini"] = "Sucesso"
-                log_entry["estabelecimento"] = extracted_data.get("estabelecimento", "Não Informado")
-                log_entry["tipo_documento"] = extracted_data.get("tipo_documento", "Não Informado")
-                log_entry["categoria"] = extracted_data.get("categoria", "Não Informado")
-                log_entry["pagamento"] = extracted_data.get("pagamento", "Não Informado")
-                log_entry["valor"] = float(extracted_data.get("valor", 0.0))
-                log_entry["data_comprovante"] = extracted_data.get("data", "")
+            # 3. Verificação do status de leitura (se ilegível, notifica e encerra)
+            if extracted_data.get("status_leitura") == "ilegivel":
+                mensagem_usuario = extracted_data.get(
+                    "mensagem_erro",
+                    "Não consegui ler os dados com clareza pois a imagem está borrada ou muito escura. Poderia enviar uma foto mais nítida, por favor?"
+                )
+                log_entry["status_gemini"] = "Ilegível"
+                log_entry["status_sheets"] = "Não Enviado (Imagem Ilegível)"
+                log_entry["erro"] = mensagem_usuario
                 log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
+                send_telegram_message(chat_id, f"⚠️ {mensagem_usuario}", message_id)
+                return
 
-                # 3. Verificação de Duplicidade antes de gravar na planilha
-                if verificar_duplicidade(extracted_data):
-                    alerta_duplicado = (
-                        "⚠️ *Atenção: Comprovante Duplicado Detectado!*\n\n"
-                        f"Já existe um registro recente para *{extracted_data.get('estabelecimento')}* "
-                        f"no valor de *R$ {float(extracted_data.get('valor', 0)):.2f}* na data *{extracted_data.get('data')}*.\n\n"
-                        "O lançamento foi ignorado para evitar duplicidade na planilha."
-                    )
-                    log_entry["status_sheets"] = "Ignorado (Duplicidade)"
-                    log_entry["erro"] = "Comprovante idêntico já cadastrado recentemente"
-                    send_telegram_message(chat_id, alerta_duplicado, message_id)
-                    processing_logs.insert(0, log_entry)
-                    return Response(status_code=status.HTTP_200_OK)
+            log_entry["status_gemini"] = "Sucesso"
+            log_entry["estabelecimento"] = extracted_data.get("estabelecimento", "Não Informado")
+            log_entry["tipo_documento"] = extracted_data.get("tipo_documento", "Não Informado")
+            log_entry["categoria"] = extracted_data.get("categoria", "Não Informado")
+            log_entry["pagamento"] = extracted_data.get("pagamento", "Não Informado")
+            log_entry["valor"] = float(extracted_data.get("valor", 0.0))
+            log_entry["data_comprovante"] = extracted_data.get("data", "")
+            log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
 
-            except Exception as e_gemini:
-                err_str = str(e_gemini)
-                log_entry["status_gemini"] = "Falha"
-                log_entry["status_sheets"] = "Cancelado (Erro Gemini)"
-                log_entry["erro"] = f"Erro no Gemini: {err_str}"
+        except Exception as e_gemini:
+            err_str = str(e_gemini)
+            log_entry["status_gemini"] = "Falha"
+            log_entry["status_sheets"] = "Cancelado (Erro Gemini)"
+            log_entry["erro"] = f"Erro no Gemini: {err_str}"
 
-                if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
-                    friendly_error = (
-                        "⏳ *Servidores do Google com Alta Demanda Temporária*\n\n"
-                        "A API do Gemini está momentaneamente sobrecarregada (Status 503).\n"
-                        "Por favor, aguarde 15 a 30 segundos e **envie a foto novamente**."
-                    )
-                else:
-                    friendly_error = f"⚠️ Não foi possível analisar o comprovante: {err_str}"
+            if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
+                friendly_error = (
+                    "⏳ *Servidores do Google com Alta Demanda Temporária*\n\n"
+                    "A API do Gemini está momentaneamente sobrecarregada (Status 503).\n"
+                    "Por favor, aguarde 15 a 30 segundos e **envie a foto novamente**."
+                )
+            else:
+                friendly_error = f"⚠️ Não foi possível analisar o comprovante: {err_str}"
 
-                send_telegram_message(chat_id, friendly_error, message_id)
-                processing_logs.insert(0, log_entry)
-                return Response(status_code=status.HTTP_200_OK)
+            send_telegram_message(chat_id, friendly_error, message_id)
+            return
 
-            # 2. Envio para a Planilha do Google Sheets
+        # 4. Verificação de Duplicidade e Gravação com Thread Lock Exclusivo
+        with sheets_write_lock:
+            # Checa se já existe na planilha ou nos registros recentes em processamento
+            if verificar_duplicidade(extracted_data):
+                alerta_duplicado = (
+                    "⚠️ *Atenção: Comprovante Duplicado Detectado!*\n\n"
+                    f"Já existe um registro recente para *{extracted_data.get('estabelecimento')}* "
+                    f"no valor de *R$ {float(extracted_data.get('valor', 0)):.2f}* na data *{extracted_data.get('data')}*.\n\n"
+                    "O lançamento foi ignorado para evitar duplicidade na planilha."
+                )
+                log_entry["status_sheets"] = "Ignorado (Duplicidade)"
+                log_entry["erro"] = "Comprovante idêntico já cadastrado recentemente"
+                send_telegram_message(chat_id, alerta_duplicado, message_id)
+                return
+
+            # Marca o status de gravação antes de iniciar o append para bloquear requisições paralelas
+            log_entry["status_sheets"] = "Gravando na Planilha..."
+
+            # 5. Envio para a Planilha do Google Sheets
             try:
                 total_linhas = append_to_sheet(extracted_data)
                 log_entry["status_sheets"] = "Enviado com Sucesso"
@@ -364,30 +360,80 @@ async def telegram_webhook(request: Request):
                 log_entry["erro"] = f"Erro Google Sheets: {str(e_sheets)}"
                 logger.error(f"Erro ao salvar na planilha Google: {e_sheets}")
                 send_telegram_message(chat_id, f"⚠️ Dados extraídos, mas falhou ao gravar na Planilha Google: {str(e_sheets)}", message_id)
-                processing_logs.insert(0, log_entry)
+                return
+
+        # 6. Notificação de Sucesso no Telegram
+        success_msg = (
+            "✅ *Lançamento Registrado com Sucesso!*\n\n"
+            f"• *Data:* {extracted_data.get('data')}\n"
+            f"• *Estabelecimento:* {extracted_data.get('estabelecimento')}\n"
+            f"• *Documento:* {extracted_data.get('tipo_documento')}\n"
+            f"• *Categoria:* {extracted_data.get('categoria')}\n"
+            f"• *Pagamento:* {extracted_data.get('pagamento')}\n"
+            f"• *Valor:* R$ {float(extracted_data.get('valor', 0)):.2f}\n\n"
+            "📊 *Gravado na Planilha do Google Sheets!*"
+        )
+        send_telegram_message(chat_id, success_msg, message_id)
+
+    except Exception as e_all:
+        logger.error(f"Erro no processamento da foto: {e_all}", exc_info=True)
+        log_entry["erro"] = str(e_all)
+        log_entry["status_sheets"] = "Erro Geral"
+    finally:
+        # Libera o lock da mensagem
+        in_progress_locks.discard(lock_key)
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
+    try:
+        update = await request.json()
+        update_id = update.get("update_id")
+
+        # 1. Deduplicação imediata por update_id (retentativas do Telegram)
+        if update_id is not None:
+            if update_id in processed_update_ids:
+                logger.info(f"Webhook update_id {update_id} já registrado ou em processamento. Ignorando repetição do Telegram.")
+                return Response(status_code=status.HTTP_200_OK)
+            processed_update_ids[update_id] = time.time()
+            # Mantém tamanho do cache controlado em até 1000 IDs
+            if len(processed_update_ids) > 1000:
+                processed_update_ids.popitem(last=False)
+
+        message = update.get("message") or update.get("channel_post")
+        if not message:
+            return Response(status_code=status.HTTP_200_OK)
+
+        chat_id = message["chat"]["id"]
+        chat_user = message.get("from", {}).get("username") or message.get("from", {}).get("first_name") or f"ID: {chat_id}"
+        message_id = message["message_id"]
+
+        # Se a mensagem contiver foto, processa em segundo plano via BackgroundTasks
+        if "photo" in message:
+            largest_photo = message["photo"][-1]
+            file_id = largest_photo["file_id"]
+            lock_key = f"{chat_id}:{message_id}:{file_id}"
+
+            # Verifica se já está em processamento
+            if lock_key in in_progress_locks:
+                logger.info(f"Mensagem {lock_key} já está em andamento. Ignorando chamada duplicada.")
                 return Response(status_code=status.HTTP_200_OK)
 
-            # 3. Notificação no Telegram
-            success_msg = (
-                "✅ *Lançamento Registrado com Sucesso!*\n\n"
-                f"• *Data:* {extracted_data.get('data')}\n"
-                f"• *Estabelecimento:* {extracted_data.get('estabelecimento')}\n"
-                f"• *Documento:* {extracted_data.get('tipo_documento')}\n"
-                f"• *Categoria:* {extracted_data.get('categoria')}\n"
-                f"• *Pagamento:* {extracted_data.get('pagamento')}\n"
-                f"• *Valor:* R$ {float(extracted_data.get('valor', 0)):.2f}\n\n"
-                "📊 *Gravado na Planilha do Google Sheets!*"
+            in_progress_locks.add(lock_key)
+
+            # Agenda execução assíncrona em background e responde IMEDIATAMENTE HTTP 200 OK ao Telegram
+            background_tasks.add_task(
+                process_receipt_photo_task,
+                chat_id=chat_id,
+                message_id=message_id,
+                chat_user=str(chat_user),
+                file_id=file_id,
+                lock_key=lock_key
             )
-            send_telegram_message(chat_id, success_msg, message_id)
-            processing_logs.insert(0, log_entry)
 
         return Response(status_code=status.HTTP_200_OK)
 
     except Exception as e:
-        logger.error(f"Erro geral no webhook: {str(e)}", exc_info=True)
-        log_entry["erro"] = str(e)
-        log_entry["status_sheets"] = "Erro Geral"
-        processing_logs.insert(0, log_entry)
+        logger.error(f"Erro ao receber webhook: {str(e)}", exc_info=True)
         return Response(status_code=status.HTTP_200_OK)
 
 @app.get("/api/logs", response_class=JSONResponse)
@@ -429,14 +475,19 @@ def dashboard_logs_page():
         """
     else:
         for log in processing_logs:
-            is_success = log.get("status_sheets") == "Enviado com Sucesso"
-            is_dup = "Duplicidade" in log.get("status_sheets", "") or "Ignorado" in log.get("status_sheets", "")
+            st = log.get("status_sheets", "")
+            is_success = st == "Enviado com Sucesso"
+            is_dup = "Duplicidade" in st or "Ignorado" in st
+            is_processing = "Gravando" in st or "Processando" in st or "Pendente" in st
+
             if is_success:
                 status_badge = '<span class="badge badge-success">✓ Gravado na Planilha</span>'
             elif is_dup:
                 status_badge = '<span class="badge badge-warning">⚠️ Ignorado (Duplicado)</span>'
+            elif is_processing:
+                status_badge = f'<span class="badge badge-info">⏳ {st}</span>'
             else:
-                status_badge = f'<span class="badge badge-error">✕ {log.get("status_sheets")}</span>'
+                status_badge = f'<span class="badge badge-error">✕ {st}</span>'
 
             erro_html = f'<div class="error-msg">{log.get("erro")}</div>' if log.get("erro") else ""
 
@@ -482,6 +533,8 @@ def dashboard_logs_page():
             --primary-light: #ecfdf5;
             --danger: #ef4444;
             --danger-light: #fef2f2;
+            --info: #0284c7;
+            --info-light: #f0f9ff;
         }}
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
@@ -665,6 +718,11 @@ def dashboard_logs_page():
             background: #fffbeb;
             color: #b45309;
             border: 1px solid #fde68a;
+        }}
+        .badge-info {{
+            background: var(--info-light);
+            color: var(--info);
+            border: 1px solid #bae6fd;
         }}
         .pill-category {{
             background: #f1f5f9;
