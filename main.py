@@ -342,6 +342,98 @@ append_to_sheet_link_direto = append_to_sheet_aba_mensal
 append_to_sheet_telegram = append_to_sheet_aba_mensal
 append_to_sheet_com_link_telegram = append_to_sheet_aba_mensal
 
+def gerar_relatorio_mensal(nome_aba: str = None) -> str:
+    """
+    Lê a aba especificada (ou a aba do mês atual) no Google Sheets,
+    calcula o total geral e o acumulado por categoria.
+    """
+    if not SPREADSHEET_ID or not GOOGLE_CREDENTIALS_JSON:
+        return "⚠️ Planilha do Google Sheets não configurada nas variáveis de ambiente."
+
+    try:
+        gc = get_sheets_client()
+        sh = gc.open_by_key(SPREADSHEET_ID)
+    except Exception as e_client:
+        logger.error(f"Erro ao conectar com Google Sheets para relatório: {e_client}")
+        return f"⚠️ Erro ao acessar o Google Sheets: {e_client}"
+    
+    # Se nenhuma aba for especificada, determina o nome da aba do mês atual
+    if not nome_aba:
+        agora = datetime.now()
+        nome_aba = f"{MESES_PT[agora.month]}_{agora.year}"
+    else:
+        # Normaliza o nome caso o usuário envie sem ano ou com minúsculas (ex: "novembro" ou "novembro_2026")
+        partes = nome_aba.strip().split("_")
+        if len(partes) == 1 and not partes[0].isdigit():
+            agora = datetime.now()
+            nome_aba = f"{partes[0].capitalize()}_{agora.year}"
+        elif len(partes) == 2:
+            nome_aba = f"{partes[0].capitalize()}_{partes[1]}"
+    
+    try:
+        worksheet = sh.worksheet(nome_aba)
+    except Exception:
+        try:
+            abas_existentes = [ws.title for ws in sh.worksheets()]
+            abas_msg = ", ".join([f"`{t}`" for t in abas_existentes if "_" in t]) or "nenhuma aba mensal encontrada"
+            return (
+                f"⚠️ Nenhuma aba encontrada para o período *{nome_aba}*.\n\n"
+                f"📂 *Abas disponíveis na planilha:* {abas_msg}\n\n"
+                "💡 *Dica:* use `/resumo Nome_Ano` (ex: `/resumo Novembro_2026`)."
+            )
+        except Exception:
+            return f"⚠️ Nenhuma aba encontrada para o período *{nome_aba}*."
+
+    # Obtém todas as linhas gravadas na aba
+    try:
+        todas_linhas = worksheet.get_all_values()
+    except Exception as e_read:
+        return f"⚠️ Erro ao ler dados da aba *{nome_aba}*: {e_read}"
+    
+    # Se houver apenas o cabeçalho ou estiver vazia
+    if len(todas_linhas) <= 1:
+        return f"📊 *Relatório Mensal — {nome_aba}*\n\nAinda não há gastos registrados nesta aba."
+
+    total_geral = 0.0
+    totais_por_categoria: Dict[str, float] = {}
+    total_itens = 0
+
+    # Itera sobre os registros (pulando a linha de cabeçalho)
+    for linha in todas_linhas[1:]:
+        if len(linha) >= 6:
+            categoria = linha[3].strip() if linha[3].strip() else "Outros"
+            try:
+                val_str = (
+                    str(linha[5])
+                    .replace("R$", "")
+                    .replace(" ", "")
+                    .replace(",", ".")
+                    .strip()
+                )
+                valor = float(val_str)
+            except ValueError:
+                valor = 0.0
+
+            total_geral += valor
+            totais_por_categoria[categoria] = totais_por_categoria.get(categoria, 0.0) + valor
+            total_itens += 1
+
+    # Formata a mensagem final em Markdown
+    relatorio = f"📊 *Relatório de Gastos — {nome_aba}*\n\n"
+    relatorio += f"📝 *Total de Comprovantes:* {total_itens}\n"
+    relatorio += f"💰 *Total Geral:* R$ {total_geral:.2f}\n\n"
+    relatorio += "📌 *Gastos por Categoria:*\n"
+    
+    # Ordena as categorias por maior valor gasto
+    categorias_ordenadas = sorted(totais_por_categoria.items(), key=lambda x: x[1], reverse=True)
+    
+    for cat, val in categorias_ordenadas:
+        percentual = (val / total_geral * 100) if total_geral > 0 else 0
+        relatorio += f"• *{cat}:* R$ {val:.2f} _({percentual:.1f}%)_\n"
+
+    relatorio += f"\n🔗 [Abrir Planilha no Google Sheets](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID})"
+    return relatorio
+
 def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, file_id: str, lock_key: str):
     """
     Executado em segundo plano (BackgroundTasks).
@@ -491,7 +583,42 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         chat_user = message.get("from", {}).get("username") or message.get("from", {}).get("first_name") or f"ID: {chat_id}"
         message_id = message["message_id"]
 
-        # Se houver foto, agenda em background e responde IMEDIATAMENTE HTTP 200 OK
+        # 2. Trata comandos de texto (como /resumo ou /resumo Novembro_2026)
+        if "text" in message:
+            texto = message["text"].strip()
+            
+            # Reconhece /resumo ou /resumo@botname
+            if texto.startswith("/resumo"):
+                partes = texto.split()
+                # Permite passar o mês ex: /resumo Outubro_2026
+                nome_aba_especifica = partes[1] if len(partes) > 1 else None
+                
+                # Registra o comando no histórico de auditoria
+                cmd_log = {
+                    "id": f"log-{int(datetime.now().timestamp() * 1000)}",
+                    "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                    "chat_id": str(chat_id),
+                    "username": str(chat_user),
+                    "status_gemini": "Comando",
+                    "status_sheets": "Consulta /resumo",
+                    "estabelecimento": f"Comando: {texto}",
+                    "tipo_documento": "Relatório",
+                    "categoria": "Consulta",
+                    "pagamento": "-",
+                    "valor": 0.0,
+                    "aba_planilha": nome_aba_especifica or "Mês Atual",
+                    "origem_foto": "Comando /resumo",
+                    "erro": None,
+                    "detalhes": f"Consulta de resumo financeiro executada por {chat_user}"
+                }
+                processing_logs.insert(0, cmd_log)
+
+                send_telegram_message(chat_id, "📊 Gerando resumo financeiro da planilha...", message_id)
+                relatorio_msg = gerar_relatorio_mensal(nome_aba_especifica)
+                send_telegram_message(chat_id, relatorio_msg, message_id)
+                return Response(status_code=status.HTTP_200_OK)
+
+        # 3. Se houver foto, agenda em background e responde IMEDIATAMENTE HTTP 200 OK
         if "photo" in message:
             largest_photo = message["photo"][-1]
             file_id = largest_photo["file_id"]

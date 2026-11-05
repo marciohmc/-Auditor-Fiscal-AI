@@ -447,6 +447,43 @@ app.post('/webhook', async (req: Request, res: Response) => {
     const chatId = message.chat?.id || 0;
     const messageId = message.message_id;
 
+    // Handle /resumo text command in webhook
+    if (message.text && typeof message.text === 'string' && message.text.trim().startsWith('/resumo')) {
+      const parts = message.text.trim().split(' ');
+      const targetMonth = parts[1] || 'Novembro_2026';
+
+      const totalGeral = fiscalEntries.reduce((sum, e) => sum + (e.valor || 0), 0);
+      const categorias: Record<string, number> = {};
+      fiscalEntries.forEach(e => {
+        categorias[e.categoria] = (categorias[e.categoria] || 0) + (e.valor || 0);
+      });
+
+      const ordenadas = Object.entries(categorias).sort((a, b) => b[1] - a[1]);
+      let reportMsg = `📊 *Relatório de Gastos — ${targetMonth}*\n\n` +
+                      `📝 *Total de Comprovantes:* ${fiscalEntries.length}\n` +
+                      `💰 *Total Geral:* R$ ${totalGeral.toFixed(2)}\n\n` +
+                      `📌 *Gastos por Categoria:*\n`;
+      for (const [cat, val] of ordenadas) {
+        const pct = totalGeral > 0 ? (val / totalGeral * 100).toFixed(1) : '0';
+        reportMsg += `• *${cat}:* R$ ${val.toFixed(2)} _(${pct}%)_\n`;
+      }
+
+      webhookLogs.unshift({
+        id: logId,
+        timestamp: new Date().toISOString(),
+        chat_id: chatId,
+        origem: 'Telegram Webhook',
+        payload_summary: `Comando executado: ${message.text}`,
+        status: 'sucesso',
+      });
+
+      return res.status(200).json({
+        status: 'ok',
+        telegram_reply: reportMsg,
+        command: '/resumo',
+      });
+    }
+
     // Process photo or direct base64 simulation
     let base64Data = req.body.simulated_image_base64;
     let mimeType = 'image/jpeg';
