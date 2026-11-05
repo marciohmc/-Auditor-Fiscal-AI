@@ -22,16 +22,41 @@ logger = logging.getLogger("finance-bot")
 # Carregamento de Variáveis de Ambiente
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY_1 = os.getenv("GEMINI_API_KEY_1")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
+# Carrega a chave principal e a secundária/reserva
+GEMINI_KEYS = [
+    GEMINI_API_KEY,
+    GEMINI_API_KEY_1
+]
+GEMINI_KEYS = [k.strip() for k in GEMINI_KEYS if k and k.strip()]
+current_key_index = 0
+
+def get_gemini_client():
+    """Retorna um cliente configurado com a chave ativa no momento (GEMINI_API_KEY ou GEMINI_API_KEY_1)."""
+    global current_key_index
+    if not GEMINI_KEYS:
+        raise ValueError("Nenhuma chave (GEMINI_API_KEY ou GEMINI_API_KEY_1) foi configurada.")
+    api_key = GEMINI_KEYS[current_key_index % len(GEMINI_KEYS)]
+    return genai.Client(api_key=api_key)
+
+def rotate_gemini_key():
+    """Alterna automaticamente para a próxima chave de reserva."""
+    global current_key_index
+    if len(GEMINI_KEYS) > 1:
+        prev_idx = current_key_index % len(GEMINI_KEYS)
+        current_key_index = (current_key_index + 1) % len(GEMINI_KEYS)
+        new_idx = current_key_index % len(GEMINI_KEYS)
+        logger.warning(f"⚠️ Chave Gemini do índice {prev_idx} esgotada/limite de cota (429). Alternando para chave do índice {new_idx} (GEMINI_API_KEY_1)...")
+    else:
+        logger.warning("⚠️ Limite de cota atingido e apenas 1 chave Gemini está configurada.")
+
 # Inicialização de Clientes
 app = FastAPI(title="Auditor Fiscal - Bot & Google Sheets Pipeline")
-
-# Configuração da Google AI API
-genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # Armazenamento em memória dos logs de processamento e envio
 processing_logs: List[Dict[str, Any]] = []
@@ -79,6 +104,8 @@ def download_telegram_file(file_id: str) -> tuple[bytes, str]:
     return file_res.content, download_url
 
 def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
+    global current_key_index
+
     system_instruction = (
         "Você é um auditor financeiro e especialista em extração multimodal de dados de documentos fiscais "
         "(notas fiscais, cupons fiscais e recibos). Sua tarefa é analisar a imagem enviada e extrair com precisão "
@@ -118,53 +145,70 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
         "Retorne estritamente o JSON sem markdown fora do objeto."
     )
 
-    # Modelos ativos recomendados pela Google AI API
-    candidate_models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"]
+    candidate_models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite", "gemini-1.5-flash"]
+    total_key_attempts = max(1, len(GEMINI_KEYS))
     last_err = None
 
-    for model_name in candidate_models:
-        for attempt in range(1, 4):
-            try:
-                logger.info(f"Tentativa {attempt}/3 com modelo {model_name}...")
-                response = genai_client.models.generate_content(
-                    model=model_name,
-                    contents=[
-                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                        user_prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        response_mime_type="application/json"
+    for key_attempt in range(total_key_attempts):
+        client = get_gemini_client()
+        active_key_idx = current_key_index % len(GEMINI_KEYS) if GEMINI_KEYS else 0
+
+        for model_name in candidate_models:
+            for attempt in range(1, 3):
+                try:
+                    logger.info(f"Tentativa {attempt}/2 com chave #{active_key_idx + 1} usando modelo {model_name}...")
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                            user_prompt
+                        ],
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_instruction,
+                            response_mime_type="application/json"
+                        )
                     )
-                )
-                raw_text = response.text.strip()
-                if raw_text.startswith("```json"):
-                    raw_text = raw_text[7:]
-                if raw_text.startswith("```"):
-                    raw_text = raw_text[3:]
-                if raw_text.endswith("```"):
-                    raw_text = raw_text[:-3]
+                    raw_text = response.text.strip()
+                    if raw_text.startswith("```json"):
+                        raw_text = raw_text[7:]
+                    if raw_text.startswith("```"):
+                        raw_text = raw_text[3:]
+                    if raw_text.endswith("```"):
+                        raw_text = raw_text[:-3]
 
-                parsed = json.loads(raw_text.strip())
-                logger.info(f"Extração bem sucedida com {model_name} na tentativa {attempt}")
-                return parsed
-            except Exception as err:
-                err_str = str(err)
-                last_err = err
-                logger.warning(f"Tentativa {attempt} com {model_name} falhou: {err_str}")
+                    parsed = json.loads(raw_text.strip())
+                    logger.info(f"Extração bem sucedida com {model_name} usando chave #{active_key_idx + 1}")
+                    return parsed
+                except Exception as err:
+                    err_str = str(err)
+                    last_err = err
+                    logger.warning(f"Chave #{active_key_idx + 1}, modelo {model_name} falhou: {err_str}")
 
-                if "404" in err_str or "NOTFOUND" in err_str or "no longer available" in err_str:
-                    logger.info(f"Modelo {model_name} descontinuado ou não encontrado. Pulando para o próximo...")
-                    break
-                
-                if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str or "429" in err_str:
-                    wait_time = attempt * 2.0
-                    logger.info(f"Alta demanda temporária da Google detectada. Aguardando {wait_time}s...")
-                    time.sleep(wait_time)
-                else:
-                    break
+                    # Se atingir erro 429 ou cota esgotada (RESOURCE_EXHAUSTED), rotaciona para a próxima chave
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "Quota" in err_str or "quota" in err_str:
+                        rotate_gemini_key()
+                        break
 
-    raise last_err or RuntimeError("Falha ao analisar imagem com Gemini AI após múltiplas tentativas.")
+                    # Se o modelo não existir ou for descontinuado (404), pula para o próximo modelo
+                    if "404" in err_str or "NOTFOUND" in err_str or "no longer available" in err_str:
+                        logger.info(f"Modelo {model_name} descontinuado ou não encontrado. Pulando para o próximo...")
+                        break
+                    
+                    # Se for erro 503 UNAVAILABLE ou alta demanda, aguarda e re-tenta
+                    if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
+                        wait_time = attempt * 2.0
+                        logger.info(f"Alta demanda temporária da Google detectada. Aguardando {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        break
+            else:
+                continue
+            break
+
+    return {
+        "status_leitura": "ilegivel",
+        "mensagem_erro": "Todas as chaves do Gemini (GEMINI_API_KEY e GEMINI_API_KEY_1) atingiram o limite diário de cota."
+    }
 
 def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> bool:
     """
@@ -675,7 +719,9 @@ def get_logs_json():
         "total_logs": len(processing_logs),
         "spreadsheet_id_configured": bool(SPREADSHEET_ID),
         "credentials_configured": bool(GOOGLE_CREDENTIALS_JSON),
-        "gemini_configured": bool(GEMINI_API_KEY),
+        "gemini_configured": bool(GEMINI_KEYS),
+        "gemini_keys_count": len(GEMINI_KEYS),
+        "active_key_index": current_key_index % len(GEMINI_KEYS) if GEMINI_KEYS else 0,
         "logs": processing_logs
     }
 
@@ -688,7 +734,7 @@ def dashboard_logs_page():
 
     # Status de configurações
     sheets_ok = bool(SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON)
-    gemini_ok = bool(GEMINI_API_KEY)
+    gemini_ok = bool(GEMINI_KEYS)
     telegram_ok = bool(TELEGRAM_BOT_TOKEN)
 
     # Geração das linhas da tabela
