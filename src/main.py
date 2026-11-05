@@ -69,12 +69,14 @@ def send_telegram_message(chat_id: int, text: str, reply_to_message_id: int = No
     except Exception as e:
         logger.error(f"Erro ao enviar mensagem Telegram: {e}")
 
-def download_telegram_file(file_id: str) -> bytes:
+def download_telegram_file(file_id: str) -> tuple[bytes, str]:
     res_path = requests.get(f"{TELEGRAM_API_BASE}/getFile", params={"file_id": file_id}, timeout=10).json()
-    file_path = res_path["result"]["file_path"]
-    download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    file_path = res_path.get("result", {}).get("file_path", "")
+    download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}" if file_path else ""
+    if not download_url:
+        raise ValueError(f"Não foi possível obter o caminho do arquivo no Telegram para o ID: {file_id}")
     file_res = requests.get(download_url, timeout=30)
-    return file_res.content
+    return file_res.content, download_url
 
 def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
     system_instruction = (
@@ -233,10 +235,10 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
             
     return False
 
-def append_to_sheet_com_link_telegram(data: dict, file_id: str = "") -> int:
+def append_to_sheet_link_direto(data: dict, file_id: str, url_direta: str = "") -> int:
     """
-    Salva uma nova linha na Planilha do Google Sheets, gerando a fórmula =HYPERLINK
-    com o link direto da API do Telegram para visualização do comprovante.
+    Grava uma nova linha na Planilha do Google Sheets, inserindo a fórmula =HYPERLINK
+    com o link direto para visualização do arquivo de imagem (.jpg) nos servidores do Telegram.
     """
     if not SPREADSHEET_ID:
         raise ValueError("SPREADSHEET_ID não configurada nas variáveis de ambiente.")
@@ -246,11 +248,28 @@ def append_to_sheet_com_link_telegram(data: dict, file_id: str = "") -> int:
     worksheet = sh.get_worksheet(0)
     
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
-    link_telegram = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}" if (bot_token and file_id) else ""
     
-    # Fórmula do Google Sheets para criar link clicável e amigável na planilha
-    formula_link = f'=HYPERLINK("{link_telegram}"; "Ver Comprovante")' if link_telegram else "Armazenado no Telegram"
-    
+    # 1. Obtém o file_path real do Telegram usando o file_id caso não tenha sido passado
+    url_direta_imagem = url_direta
+    if not url_direta_imagem and file_id and bot_token:
+        try:
+            res_path = requests.get(f"https://api.telegram.org/bot{bot_token}/getFile", params={"file_id": file_id}, timeout=10).json()
+            if res_path.get("ok"):
+                file_path = res_path["result"]["file_path"]
+                # 2. Monta a URL direta para o arquivo de imagem nos servidores do Telegram
+                url_direta_imagem = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
+        except Exception as e:
+            logger.warning(f"Erro ao obter file_path para link direto: {e}")
+            
+    if not url_direta_imagem:
+        url_direta_imagem = "Não disponível"
+
+    # 3. Cria a fórmula clicável no Google Sheets para abrir a foto diretamente
+    if url_direta_imagem.startswith("http"):
+        formula_link = f'=HYPERLINK("{url_direta_imagem}"; "Ver Imagem")'
+    else:
+        formula_link = "Armazenado no Telegram"
+
     row = [
         str(data.get("data", "Não Informado")),
         str(data.get("estabelecimento", "Não Informado")),
@@ -258,19 +277,19 @@ def append_to_sheet_com_link_telegram(data: dict, file_id: str = "") -> int:
         str(data.get("categoria", "Não Informado")),
         str(data.get("pagamento", "Não Informado")),
         float(data.get("valor", 0.0)),
-        formula_link  # 7ª coluna: Link do Comprovante no Telegram
+        formula_link  # <--- Insere o link direto da imagem
     ]
-    
+
     try:
         worksheet.append_row(row, value_input_option='USER_ENTERED')
     except Exception as e_user_entered:
-        logger.warning(f"Tentativa com USER_ENTERED falhou ({e_user_entered}). Tentando formato compatível...")
-        if link_telegram:
-            row[6] = f'=HYPERLINK("{link_telegram}", "Ver Comprovante")'
+        logger.warning(f"Tentativa com USER_ENTERED falhou ({e_user_entered}). Tentando formato com vírgula...")
+        if url_direta_imagem.startswith("http"):
+            row[6] = f'=HYPERLINK("{url_direta_imagem}", "Ver Imagem")'
             try:
                 worksheet.append_row(row, value_input_option='USER_ENTERED')
             except Exception:
-                row[6] = link_telegram
+                row[6] = url_direta_imagem
                 worksheet.append_row(row)
         else:
             worksheet.append_row(row)
@@ -278,8 +297,9 @@ def append_to_sheet_com_link_telegram(data: dict, file_id: str = "") -> int:
     return len(worksheet.get_all_values())
 
 # Aliases para compatibilidade total
-append_to_sheet_telegram = append_to_sheet_com_link_telegram
-append_to_sheet = append_to_sheet_com_link_telegram
+append_to_sheet = append_to_sheet_link_direto
+append_to_sheet_telegram = append_to_sheet_link_direto
+append_to_sheet_com_link_telegram = append_to_sheet_link_direto
 
 def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, file_id: str, lock_key: str):
     """
@@ -312,7 +332,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
 
         # 2. Download da imagem do Telegram e Análise com Gemini
         try:
-            img_bytes = download_telegram_file(file_id)
+            img_bytes, url_direta_imagem = download_telegram_file(file_id)
             extracted_data = analyze_receipt(img_bytes)
 
             # 3. Verificação do status de leitura (se ilegível, notifica e encerra sem gravar)
@@ -372,15 +392,13 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             # Marca o status de gravação antes de iniciar o append para bloquear requisições paralelas
             log_entry["status_sheets"] = "Gravando na Planilha..."
 
-            # 5. Salva na planilha com os dados extraídos e a fórmula de link do Telegram
+            # 5. Salva na planilha com os dados extraídos e a fórmula de link direto da imagem
             try:
-                bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
-                link_telegram = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}" if (bot_token and file_id) else ""
-                log_entry["link_telegram"] = link_telegram
+                log_entry["link_telegram"] = url_direta_imagem
                 
-                total_linhas = append_to_sheet_com_link_telegram(extracted_data, file_id)
+                total_linhas = append_to_sheet_link_direto(extracted_data, file_id, url_direta_imagem)
                 log_entry["status_sheets"] = "Enviado com Sucesso"
-                log_entry["detalhes"] += f" | Linha registrada: {total_linhas} | Link Telegram: OK"
+                log_entry["detalhes"] += f" | Linha registrada: {total_linhas} | Imagem Direta: OK"
             except Exception as e_sheets:
                 log_entry["status_sheets"] = "Falha no Envio"
                 log_entry["erro"] = f"Erro Google Sheets: {str(e_sheets)}"
