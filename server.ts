@@ -199,22 +199,19 @@ async function analyzeFiscalImage(base64Data: string, mimeType: string) {
     "estritamente um JSON estruturado com os dados financeiros extraídos.";
 
   const userPrompt = 
-    "Analise esta imagem de comprovante/nota fiscal e extraia os dados conforme as regras abaixo:\n\n" +
-    "1. Identifique se o documento é uma 'Nota Fiscal', 'Cupom Fiscal' ou 'Recibo'.\n" +
-    "2. Classifique o gasto em uma das seguintes categorias padronizadas: Alimentação, Transporte, Saúde, Lazer, Moradia, Veículo, Educação ou Outros.\n" +
-    "3. Identifique a forma de pagamento utilizada (PIX, Cartão de Crédito, Cartão de Débito, Dinheiro, Boleto ou Não Informado).\n" +
-    "4. Converta e formate o valor total para número flutuante (ex: 45.90). Se não for possível identificar o valor, atribua 0.00.\n" +
-    "5. Formate a data no padrão brasileiro DD/MM/AAAA. Se o ano não estiver explícito, assuma o ano corrente. Se a data estiver ilegível, atribua 'Não Informado'.\n" +
-    "6. Se algum campo estiver ilegível ou ausente na imagem, atribua o valor 'Não Informado'.\n\n" +
-    "Extraia estritamente um JSON no seguinte formato:\n" +
-    "{\n" +
-    '  "tipo_documento": "Nota Fiscal / Cupom Fiscal / Recibo",\n' +
-    '  "data": "DD/MM/AAAA",\n' +
-    '  "estabelecimento": "Nome do Fornecedor / Estabelecimento",\n' +
-    '  "valor": 0.00,\n' +
-    '  "categoria": "Alimentação / Transporte / Saúde / Lazer / Moradia / Veículo / Educação / Outros",\n' +
-    '  "pagamento": "PIX / Cartão de Crédito / Cartão de Débito / Dinheiro / Boleto / Não Informado"\n' +
-    "}\n\n" +
+    "Analise esta imagem de documento fiscal conforme as regras abaixo:\n\n" +
+    "1. VALIDAÇÃO DE LEGIBILIDADE (CRÍTICO):\n" +
+    "- Se a imagem estiver borrada, muito escura, cortada ou se os dados principais (valor total, estabelecimento ou data) estiverem completamente ilegíveis, defina 'status_leitura': 'ilegivel' e forneça uma justificativa amigável em 'mensagem_erro'.\n" +
+    "- Se a imagem for legível, defina 'status_leitura': 'sucesso' e 'mensagem_erro': null.\n\n" +
+    "2. CLASSIFICAÇÃO DO DOCUMENTO:\n" +
+    "- 'tipo_documento': 'Nota Fiscal', 'Cupom Fiscal' ou 'Recibo'.\n" +
+    "- 'categoria': 'Alimentação', 'Transporte', 'Saúde', 'Lazer', 'Moradia', 'Veículo', 'Educação' ou 'Outros'.\n" +
+    "- 'pagamento': 'PIX', 'Cartão de Crédito', 'Cartão de Débito', 'Dinheiro', 'Boleto' ou 'Não Informado'.\n\n" +
+    "3. EXTRAÇÃO DE ITENS DETALHADOS:\n" +
+    "- Extraia a lista de itens comprados no array 'itens' com 'descricao', 'quantidade' e 'valor_total_item'. Se não houver itens, retorne [].\n\n" +
+    "4. FORMATAÇÃO E TIPAGEM:\n" +
+    "- 'valor': float do valor total líquido (ex: 125.50).\n" +
+    "- 'data': padrão DD/MM/AAAA.\n\n" +
     "Não inclua texto, explicação ou marcações markdown (como ```json) fora do objeto JSON.";
 
   // Resilient model invocation with retry and fallback
@@ -243,6 +240,14 @@ async function analyzeFiscalImage(base64Data: string, mimeType: string) {
           responseSchema: {
             type: Type.OBJECT,
             properties: {
+              status_leitura: {
+                type: Type.STRING,
+                description: "'sucesso' ou 'ilegivel'",
+              },
+              mensagem_erro: {
+                type: Type.STRING,
+                description: "Mensagem amigável de erro se status_leitura for 'ilegivel', senão null",
+              },
               tipo_documento: {
                 type: Type.STRING,
                 description: "Classificação: 'Nota Fiscal', 'Cupom Fiscal' ou 'Recibo'",
@@ -286,12 +291,7 @@ async function analyzeFiscalImage(base64Data: string, mimeType: string) {
               },
             },
             required: [
-              'tipo_documento',
-              'data',
-              'estabelecimento',
-              'valor',
-              'categoria',
-              'pagamento',
+              'status_leitura',
             ],
           },
         },
@@ -449,6 +449,27 @@ app.post('/webhook', async (req: Request, res: Response) => {
       }
 
       const { parsed, rawText } = await analyzeFiscalImage(base64Data, mimeType);
+
+      // Verificação de legibilidade do comprovante
+      if (parsed.status_leitura === 'ilegivel') {
+        const mensagemUsuario = parsed.mensagem_erro || 'Não foi possível ler a foto. Envie uma foto mais nítida.';
+        webhookLogs.unshift({
+          id: logId,
+          timestamp: new Date().toISOString(),
+          chat_id: chatId,
+          origem: 'Telegram Webhook',
+          payload_summary: `Foto ilegível rejeitada: ${mensagemUsuario}`,
+          status: 'erro',
+          extracted_data: parsed,
+          error_message: mensagemUsuario,
+        });
+
+        return res.status(200).json({
+          status: 'ok',
+          telegram_reply: `⚠️ ${mensagemUsuario}`,
+          is_ilegivel: true,
+        });
+      }
 
       // Create new fiscal entry matching user's append_to_sheet pipeline
       const newEntry: StoredFiscalEntry = {

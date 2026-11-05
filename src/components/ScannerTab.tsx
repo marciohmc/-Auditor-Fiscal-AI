@@ -102,16 +102,26 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({ onEntrySaved }) => {
         throw new Error(result.error || 'Erro ao processar a imagem do comprovante fiscal.');
       }
 
+      if (result.extracted?.status_leitura === 'ilegivel') {
+        setErrorMessage(
+          result.extracted.mensagem_erro ||
+            'Não consegui ler os dados com clareza pois a imagem está borrada ou muito escura. Poderia enviar uma foto mais nítida, por favor?'
+        );
+        setExtractedData(null);
+        setRawJson(result.raw_json || JSON.stringify(result.extracted, null, 2));
+        return;
+      }
+
       setExtractedData(result.extracted);
       setRawJson(result.raw_json || JSON.stringify(result.extracted, null, 2));
 
       // Init editable fields
-      setEditableEstabelecimento(result.extracted.estabelecimento);
-      setEditableValor(result.extracted.valor);
-      setEditableData(result.extracted.data);
-      setEditableCategoria(result.extracted.categoria);
-      setEditablePagamento(result.extracted.pagamento);
-      setEditableTipo(result.extracted.tipo_documento);
+      setEditableEstabelecimento(result.extracted.estabelecimento || '');
+      setEditableValor(result.extracted.valor || 0);
+      setEditableData(result.extracted.data || '');
+      setEditableCategoria(result.extracted.categoria || 'Outros');
+      setEditablePagamento(result.extracted.pagamento || 'Não Informado');
+      setEditableTipo(result.extracted.tipo_documento || 'Nota Fiscal');
     } catch (err: any) {
       console.error(err);
       setErrorMessage(err.message || 'Falha na conexão com o servidor de inteligência fiscal.');

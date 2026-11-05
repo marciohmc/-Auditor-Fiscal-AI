@@ -28,6 +28,8 @@ export interface ItemComprovante {
 }
 
 export interface ExtractedFiscalData {
+  status_leitura?: 'sucesso' | 'ilegivel';
+  mensagem_erro?: string | null;
   tipo_documento: TipoDocumento;
   data: string;
   estabelecimento: string;

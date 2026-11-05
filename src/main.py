@@ -72,25 +72,42 @@ import time
 
 def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
     system_instruction = (
-        "Você é um assistente especialista em auditoria financeira e extração de dados de comprovantes fiscais. "
-        "Sua tarefa é analisar imagens de notas fiscais, cupons fiscais e recibos enviados pelos usuários e retornar "
-        "estritamente um JSON estruturado com os dados financeiros extraídos."
+        "Você é um auditor financeiro e especialista em extração multimodal de dados de documentos fiscais "
+        "(notas fiscais, cupons fiscais e recibos). Sua tarefa é analisar a imagem enviada e extrair com precisão "
+        "os dados financeiros e a lista de itens comprados, se houver, retornando estritamente um JSON padronizado."
     )
     
     user_prompt = (
-        "Analise esta imagem de comprovante/nota fiscal e extraia os dados conforme as regras abaixo:\n"
-        "1. Identifique se o documento é uma 'Nota Fiscal', 'Cupom Fiscal' ou 'Recibo'.\n"
-        "2. Extraia estritamente um JSON no seguinte formato:\n"
+        "Analise esta imagem de documento fiscal conforme as regras abaixo:\n\n"
+        "1. VALIDAÇÃO DE LEGIBILIDADE (CRÍTICO):\n"
+        "- Se a imagem estiver borrada, muito escura, cortada ou se os dados principais (valor total, estabelecimento ou data) "
+        "estiverem completamente ilegíveis, defina 'status_leitura': 'ilegivel' e forneça uma justificativa amigável em 'mensagem_erro'.\n"
+        "- Se a imagem for legível, defina 'status_leitura': 'sucesso' e 'mensagem_erro': null.\n\n"
+        "2. CLASSIFICAÇÃO DO DOCUMENTO:\n"
+        "- 'tipo_documento': 'Nota Fiscal', 'Cupom Fiscal' ou 'Recibo'.\n"
+        "- 'categoria': 'Alimentação', 'Transporte', 'Saúde', 'Lazer', 'Moradia', 'Veículo', 'Educação' ou 'Outros'.\n"
+        "- 'pagamento': 'PIX', 'Cartão de Crédito', 'Cartão de Débito', 'Dinheiro', 'Boleto' ou 'Não Informado'.\n\n"
+        "3. EXTRAÇÃO DE ITENS DETALHADOS:\n"
+        "- Extraia a lista de itens comprados no array 'itens' com 'descricao', 'quantidade' (float/int) e 'valor_total_item' (float).\n"
+        "- Se a nota não discriminar itens individuais, retorne lista vazia [].\n\n"
+        "4. FORMATAÇÃO E TIPAGEM:\n"
+        "- 'valor': float do valor total líquido (ex: 125.50).\n"
+        "- 'data': padrão DD/MM/AAAA.\n\n"
+        "Estrutura JSON esperada:\n"
         "{\n"
+        '  "status_leitura": "sucesso",\n'
+        '  "mensagem_erro": null,\n'
         '  "tipo_documento": "Nota Fiscal / Cupom Fiscal / Recibo",\n'
         '  "data": "DD/MM/AAAA",\n'
-        '  "estabelecimento": "Nome do Fornecedor / Estabelecimento",\n'
+        '  "estabelecimento": "Nome do Estabelecimento",\n'
         '  "valor": 0.00,\n'
         '  "categoria": "Alimentação / Transporte / Saúde / Lazer / Moradia / Veículo / Educação / Outros",\n'
-        '  "pagamento": "PIX / Cartão de Crédito / Cartão de Débito / Dinheiro / Boleto / Não Informado"\n'
-        "}\n"
-        "3. Se algum campo não estiver visível ou legível na imagem, atribua 'Não Informado' (ou 0.00 para valor).\n"
-        "4. Não inclua texto, explicação ou marcações markdown (como ```json) fora do objeto JSON."
+        '  "pagamento": "PIX / Cartão de Crédito / Cartão de Débito / Dinheiro / Boleto / Não Informado",\n'
+        '  "itens": [\n'
+        '    {"descricao": "Item 1", "quantidade": 1, "valor_total_item": 10.00}\n'
+        '  ]\n'
+        "}\n\n"
+        "Retorne estritamente o JSON sem markdown fora do objeto."
     )
 
     # Apenas modelos ativos e recomendados pela Google AI API
@@ -207,6 +224,21 @@ async def telegram_webhook(request: Request):
             try:
                 img_bytes = download_telegram_file(file_id)
                 extracted_data = analyze_receipt(img_bytes)
+
+                # Verificação do status de leitura (se ilegível, notifica e não grava na planilha)
+                if extracted_data.get("status_leitura") == "ilegivel":
+                    mensagem_usuario = extracted_data.get(
+                        "mensagem_erro",
+                        "Não consegui ler os dados com clareza pois a imagem está borrada ou muito escura. Poderia enviar uma foto mais nítida, por favor?"
+                    )
+                    log_entry["status_gemini"] = "Ilegível"
+                    log_entry["status_sheets"] = "Não Enviado (Imagem Ilegível)"
+                    log_entry["erro"] = mensagem_usuario
+                    log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
+                    send_telegram_message(chat_id, f"⚠️ {mensagem_usuario}", message_id)
+                    processing_logs.insert(0, log_entry)
+                    return Response(status_code=status.HTTP_200_OK)
+
                 log_entry["status_gemini"] = "Sucesso"
                 log_entry["estabelecimento"] = extracted_data.get("estabelecimento", "Não Informado")
                 log_entry["tipo_documento"] = extracted_data.get("tipo_documento", "Não Informado")

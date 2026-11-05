@@ -189,6 +189,16 @@ def append_to_sheet(data: Dict[str, Any]):
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     # Processa mensagens de foto enviadas ao bot Telegram
+    ...
+    extracted_data = analyze_receipt(img_bytes)
+    
+    # Verificação de status de leitura (se ilegível, alerta o usuário e não grava)
+    if extracted_data.get("status_leitura") == "ilegivel":
+        msg = extracted_data.get("mensagem_erro", "Não foi possível ler a foto. Envie uma foto mais nítida.")
+        send_telegram_message(chat_id, f"⚠️ {msg}", message_id)
+        return Response(status_code=status.HTTP_200_OK)
+        
+    append_to_sheet(extracted_data)
     ...`;
 
   const requirementsCode = `fastapi==0.115.0
