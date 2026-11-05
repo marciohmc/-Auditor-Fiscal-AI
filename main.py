@@ -339,16 +339,19 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
 
     candidate_models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite", "gemini-1.5-flash"]
     total_key_attempts = max(1, len(GEMINI_KEYS))
+    historico_tentativas: List[str] = []
+    houve_rotacao = False
     last_err = None
 
     for key_attempt in range(total_key_attempts):
         client = get_gemini_client()
         active_key_idx = current_key_index % len(GEMINI_KEYS) if GEMINI_KEYS else 0
+        key_name = f"Chave #{active_key_idx + 1} ({'GEMINI_API_KEY' if active_key_idx == 0 else 'GEMINI_API_KEY_1'})"
 
         for model_name in candidate_models:
             for attempt in range(1, 3):
                 try:
-                    logger.info(f"Tentativa {attempt}/2 com chave #{active_key_idx + 1} usando modelo {model_name}...")
+                    logger.info(f"Tentativa {attempt}/2 com {key_name} usando modelo {model_name}...")
                     response = client.models.generate_content(
                         model=model_name,
                         contents=[
@@ -369,16 +372,28 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
                         raw_text = raw_text[:-3]
 
                     parsed = json.loads(raw_text.strip())
-                    logger.info(f"Extração bem sucedida com {model_name} usando chave #{active_key_idx + 1}")
+                    historico_tentativas.append(f"[{key_name}] Modelo {model_name} (Tentativa {attempt}/2): Sucesso ✓")
+                    logger.info(f"Extração bem sucedida com {model_name} usando {key_name}")
+
+                    parsed["_telemetria_gemini"] = {
+                        "modelo_usado": model_name,
+                        "chave_usada": key_name,
+                        "historico_tentativas": historico_tentativas,
+                        "houve_rotacao": houve_rotacao
+                    }
                     return parsed
+
                 except Exception as err:
                     err_str = str(err)
                     last_err = err
-                    logger.warning(f"Chave #{active_key_idx + 1}, modelo {model_name} falhou: {err_str}")
+                    historico_tentativas.append(f"[{key_name}] Modelo {model_name} (Tentativa {attempt}/2): Falha -> {err_str[:120]}")
+                    logger.warning(f"{key_name}, modelo {model_name} falhou: {err_str}")
 
                     # Se atingir erro 429 ou cota esgotada (RESOURCE_EXHAUSTED), rotaciona para a próxima chave
                     if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "Quota" in err_str or "quota" in err_str:
                         rotate_gemini_key()
+                        houve_rotacao = True
+                        historico_tentativas.append(f"⚠️ Rotação disparada devido ao limite de cota 429 na {key_name}")
                         break
 
                     # Se o modelo não existir ou for descontinuado (404), pula para o próximo modelo
@@ -399,7 +414,13 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
 
     return {
         "status_leitura": "ilegivel",
-        "mensagem_erro": "Todas as chaves do Gemini (GEMINI_API_KEY e GEMINI_API_KEY_1) atingiram o limite diário de cota."
+        "mensagem_erro": f"Todas as chaves do Gemini ({' e '.join(GEMINI_KEYS)}) falharam ou atingiram limite diário. Erro: {last_err}",
+        "_telemetria_gemini": {
+            "modelo_usado": candidate_models[-1],
+            "chave_usada": f"Chave #{(current_key_index % len(GEMINI_KEYS)) + 1}" if GEMINI_KEYS else "Nenhuma",
+            "historico_tentativas": historico_tentativas,
+            "houve_rotacao": houve_rotacao
+        }
     }
 
 def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> bool:
@@ -708,6 +729,12 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
         try:
             img_bytes, url_direta_imagem = download_telegram_file(file_id)
             extracted_data = analyze_receipt(img_bytes)
+
+            telemetria = extracted_data.pop("_telemetria_gemini", {})
+            log_entry["modelo_gemini"] = telemetria.get("modelo_usado", "-")
+            log_entry["chave_gemini"] = telemetria.get("chave_usada", "-")
+            log_entry["historico_tentativas"] = telemetria.get("historico_tentativas", [])
+            log_entry["houve_rotacao"] = telemetria.get("houve_rotacao", False)
 
             # 3. Verificação do status de leitura (se ilegível, notifica e encerra sem gravar)
             if extracted_data.get("status_leitura") == "ilegivel":
@@ -2583,8 +2610,8 @@ def system_logs_page(request: Request):
                     <thead>
                         <tr>
                             <th>Data / Hora</th>
-                            <th>ID do Evento</th>
-                            <th>Origem / Usuário</th>
+                            <th>ID / Origem</th>
+                            <th>Modelo & Chave Gemini</th>
                             <th>Status Gemini</th>
                             <th>Status Planilha</th>
                             <th>Estabelecimento / Erro</th>
@@ -2622,6 +2649,8 @@ def system_logs_page(request: Request):
                 </div>
                 <button class="modal-close" onclick="closeModal()">✕</button>
             </div>
+
+            <div id="attemptsContainer" style="margin-bottom:16px;"></div>
 
             <div>
                 <pre class="json-pre" id="jsonContainer"></pre>
@@ -2670,6 +2699,8 @@ def system_logs_page(request: Request):
                     (log.id || '').toLowerCase().includes(searchText) ||
                     (log.timestamp || '').toLowerCase().includes(searchText) ||
                     (log.username || '').toLowerCase().includes(searchText) ||
+                    (log.modelo_gemini || '').toLowerCase().includes(searchText) ||
+                    (log.chave_gemini || '').toLowerCase().includes(searchText) ||
                     (log.estabelecimento || '').toLowerCase().includes(searchText) ||
                     (log.erro || '').toLowerCase().includes(searchText) ||
                     (log.detalhes || '').toLowerCase().includes(searchText) ||
@@ -2749,14 +2780,24 @@ def system_logs_page(request: Request):
                     (log.estabelecimento !== '-' ? `<div style="font-weight:600;">${log.estabelecimento}</div>` : '');
 
                 const userStr = log.username || log.responsavel || '-';
+                const modelStr = log.modelo_gemini || '-';
+                const keyStr = log.chave_gemini || '-';
+                const rotBadge = log.houve_rotacao ? '<div style="margin-top:2px;"><span class="badge badge-warning" style="font-size:10px;">🔄 Rotacionou Chave</span></div>' : '';
 
                 tr.innerHTML = `
                     <td class="font-mono text-muted" style="font-size:12px;">${log.timestamp || '-'}</td>
-                    <td class="font-mono" style="font-size:11px; color:var(--text-muted);">${log.id || '-'}</td>
-                    <td><div class="font-bold">${userStr}</div><div class="text-muted" style="font-size:11px;">Chat ID: ${log.chat_id || '-'}</div></td>
+                    <td>
+                        <div class="font-mono font-bold" style="font-size:11px;">${log.id || '-'}</div>
+                        <div class="text-muted font-bold" style="font-size:11px;">${userStr}</div>
+                    </td>
+                    <td>
+                        <div class="font-mono font-bold" style="font-size:11px; color:var(--info);">${modelStr}</div>
+                        <div class="text-muted" style="font-size:11px;">${keyStr}</div>
+                        ${rotBadge}
+                    </td>
                     <td>${geminiBadge}</td>
                     <td>${sheetsBadge}</td>
-                    <td style="max-width:320px;">${erroOrInfo}<div class="text-muted" style="font-size:11px; max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${log.origem_foto || log.detalhes || ''}</div></td>
+                    <td style="max-width:300px;">${erroOrInfo}<div class="text-muted" style="font-size:11px; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${log.origem_foto || log.detalhes || ''}</div></td>
                     <td class="text-center">
                         <button class="btn-action" style="padding:4px 8px; font-size:11px;" onclick="openLogModal('${log.id}')">
                             📜 Ver JSON
@@ -2782,7 +2823,19 @@ def system_logs_page(request: Request):
             if (!log) return;
 
             document.getElementById('modalLogTitle').textContent = `Log #${log.id}`;
-            document.getElementById('modalLogSubtitle').textContent = `Registrado em ${log.timestamp || ''} pelo usuário ${log.username || 'Sistema'}`;
+            document.getElementById('modalLogSubtitle').textContent = `Modelo: ${log.modelo_gemini || 'N/A'} — ${log.chave_gemini || 'N/A'}`;
+
+            const attemptsContainer = document.getElementById('attemptsContainer');
+            if (log.historico_tentativas && log.historico_tentativas.length > 0) {
+                let html = '<div style="font-weight:700; font-size:12px; margin-bottom:6px;">📋 Histórico Completo de Tentativas / Rotações do Gemini:</div><ul style="font-size:12px; font-family:\'JetBrains Mono\', monospace; background:var(--surface-hover); padding:10px 14px; border-radius:8px; border:1px solid var(--border-color); list-style:none;">';
+                log.historico_tentativas.forEach(item => {
+                    html += `<li style="margin-bottom:4px; ${item.includes('Sucesso') ? 'color:var(--primary);' : (item.includes('Rotação') ? 'color:#d97706;' : 'color:var(--text-muted);')}">${item}</li>`;
+                });
+                html += '</ul>';
+                attemptsContainer.innerHTML = html;
+            } else {
+                attemptsContainer.innerHTML = '';
+            }
 
             document.getElementById('jsonContainer').textContent = JSON.stringify(log, null, 2);
             document.getElementById('jsonModal').classList.add('active');
