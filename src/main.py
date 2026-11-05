@@ -3,12 +3,14 @@ import json
 import logging
 import time
 import threading
+import urllib.parse
+import hashlib
 from collections import OrderedDict
 from datetime import datetime
 from typing import Dict, Any, List, Set
 
 from fastapi import FastAPI, Request, Response, BackgroundTasks, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
@@ -25,8 +27,198 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_API_KEY_1 = os.getenv("GEMINI_API_KEY_1")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+PASSCM = os.getenv("PASSCM", "").strip()
 
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
+
+def is_authenticated(request: Request) -> bool:
+    """Verifica se o usuário possui o cookie de sessão válido gerado a partir da senha PASSCM."""
+    passcm = os.getenv("PASSCM", "").strip()
+    if not passcm:
+        # Se a variável PASSCM não estiver definida no ambiente, permite acesso livre ao painel
+        return True
+    session_cookie = request.cookies.get("auth_session")
+    if not session_cookie:
+        return False
+    expected_token = hashlib.sha256(f"auth_session_token:{passcm}".encode()).hexdigest()
+    return session_cookie == expected_token
+
+def render_login_html(error_msg: str = None, notice_msg: str = None) -> str:
+    """Gera a interface visual da tela de login responsiva em HTML."""
+    passcm = os.getenv("PASSCM", "").strip()
+    
+    error_html = f'<div class="alert-danger">{error_msg}</div>' if error_msg else ""
+    
+    notice_html = ""
+    if notice_msg:
+        notice_html = f'<div class="alert-warning">{notice_msg}</div>'
+    elif not passcm:
+        notice_html = '<div class="alert-warning">⚠️ A variável <b>PASSCM</b> não está configurada no ambiente do Render. Defina a senha no painel Environment para ativar a restrição de acesso.</div>'
+
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Acesso Restrito - Auditor Fiscal Bot</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {{
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --border-color: #334155;
+            --primary: #10b981;
+            --primary-hover: #059669;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --danger: #ef4444;
+        }}
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }}
+        .login-card {{
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 40px;
+            width: 100%;
+            max-width: 420px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+        }}
+        .login-header {{
+            text-align: center;
+            margin-bottom: 32px;
+        }}
+        .icon-circle {{
+            width: 64px;
+            height: 64px;
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            margin: 0 auto 16px;
+        }}
+        .login-header h1 {{
+            font-size: 22px;
+            font-weight: 800;
+            color: #ffffff;
+            margin-bottom: 6px;
+        }}
+        .login-header p {{
+            font-size: 13px;
+            color: var(--text-muted);
+        }}
+        .form-group {{
+            margin-bottom: 24px;
+        }}
+        .form-group label {{
+            display: block;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }}
+        .input-field {{
+            width: 100%;
+            padding: 14px 16px;
+            background: #0f172a;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            color: #ffffff;
+            font-size: 15px;
+            font-family: 'JetBrains Mono', monospace;
+            outline: none;
+            transition: all 0.2s;
+        }}
+        .input-field:focus {{
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
+        }}
+        .btn-submit {{
+            width: 100%;
+            padding: 14px;
+            background: var(--primary);
+            color: #ffffff;
+            border: none;
+            border-radius: 12px;
+            font-size: 15px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: background 0.2s;
+        }}
+        .btn-submit:hover {{
+            background: var(--primary-hover);
+        }}
+        .alert-danger {{
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #fca5a5;
+            padding: 12px;
+            border-radius: 10px;
+            font-size: 13px;
+            margin-bottom: 20px;
+            text-align: center;
+        }}
+        .alert-warning {{
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            color: #fde68a;
+            padding: 12px;
+            border-radius: 10px;
+            font-size: 12px;
+            margin-bottom: 20px;
+            text-align: center;
+        }}
+        .footer-text {{
+            text-align: center;
+            margin-top: 24px;
+            font-size: 12px;
+            color: var(--text-muted);
+        }}
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="login-header">
+            <div class="icon-circle">🔐</div>
+            <h1>Acesso ao Painel</h1>
+            <p>Informe a senha de administrador (PASSCM) para visualizar os dados de auditoria</p>
+        </div>
+
+        {error_html}
+        {notice_html}
+
+        <form action="/login" method="POST">
+            <div class="form-group">
+                <label for="password">Senha de Acesso (PASSCM)</label>
+                <input type="password" id="password" name="password" class="input-field" placeholder="Digite a senha..." required autofocus>
+            </div>
+            <button type="submit" class="btn-submit">🔑 Entrar no Painel</button>
+        </form>
+
+        <div class="footer-text">
+            Bot Financeiro Telegram & Google Sheets
+        </div>
+    </div>
+</body>
+</html>
+"""
+
 
 # Carrega a chave principal e a secundária/reserva
 GEMINI_KEYS = [
@@ -725,8 +917,47 @@ def get_logs_json():
         "logs": processing_logs
     }
 
+@app.get("/login", response_class=HTMLResponse)
+def login_page_get(request: Request):
+    if is_authenticated(request):
+        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+    return HTMLResponse(content=render_login_html(), status_code=200)
+
+@app.post("/login")
+async def login_page_post(request: Request):
+    passcm = os.getenv("PASSCM", "").strip()
+    
+    raw_body = (await request.body()).decode("utf-8")
+    parsed_body = urllib.parse.parse_qs(raw_body)
+    password_input = parsed_body.get("password", [""])[0].strip()
+
+    if not passcm or password_input == passcm:
+        token = hashlib.sha256(f"auth_session_token:{passcm}".encode()).hexdigest()
+        response = RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+        response.set_cookie(
+            key="auth_session",
+            value=token,
+            max_age=604800,
+            httponly=True,
+            path="/"
+        )
+        return response
+
+    return HTMLResponse(
+        content=render_login_html(error_msg="⚠️ Senha incorreta. Tente novamente."),
+        status_code=status.HTTP_401_UNAUTHORIZED
+    )
+
+@app.get("/logout")
+def logout_get():
+    response = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+    response.delete_cookie(key="auth_session", path="/")
+    return response
+
 @app.get("/", response_class=HTMLResponse)
-def dashboard_logs_page():
+def dashboard_logs_page(request: Request):
+    if not is_authenticated(request):
+        return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
     total_recebidos = len(processing_logs)
     sucessos_sheets = sum(1 for log in processing_logs if log.get("status_sheets") == "Enviado com Sucesso")
     falhas_sheets = sum(1 for log in processing_logs if "Falha" in log.get("status_sheets", "") or "Erro" in log.get("status_sheets", ""))
@@ -1107,7 +1338,10 @@ def dashboard_logs_page():
         <div class="table-card">
             <div class="table-header">
                 <h2>Histórico de Envios para a Planilha do Google</h2>
-                <button class="refresh-btn" onclick="window.location.reload()">↻ Atualizar (Auto 15s)</button>
+                <div style="display: flex; gap: 8px; align-items: center;">
+                    <a href="/logout" class="refresh-btn" style="color: #ef4444; border-color: #fecaca; text-decoration: none; display: inline-flex; align-items: center; gap: 4px;">🚪 Sair</a>
+                    <button class="refresh-btn" onclick="window.location.reload()">↻ Atualizar (Auto 15s)</button>
+                </div>
             </div>
             <div style="overflow-x: auto;">
                 <table>
