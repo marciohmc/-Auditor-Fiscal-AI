@@ -233,10 +233,10 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
             
     return False
 
-def append_to_sheet_telegram(data: dict, file_id: str = "") -> int:
+def append_to_sheet_com_link_telegram(data: dict, file_id: str = "") -> int:
     """
-    Salva uma nova linha na Planilha do Google Sheets, registrando a referência segura
-    do comprovante que permanece permanentemente armazenado no chat do Telegram.
+    Salva uma nova linha na Planilha do Google Sheets, gerando a fórmula =HYPERLINK
+    com o link direto da API do Telegram para visualização do comprovante.
     """
     if not SPREADSHEET_ID:
         raise ValueError("SPREADSHEET_ID não configurada nas variáveis de ambiente.")
@@ -245,7 +245,11 @@ def append_to_sheet_telegram(data: dict, file_id: str = "") -> int:
     sh = gc.open_by_key(SPREADSHEET_ID)
     worksheet = sh.get_worksheet(0)
     
-    ref_telegram = f"Armazenado no Telegram (ID: {file_id[:10]}...)" if file_id else "Armazenado no Telegram"
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
+    link_telegram = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}" if (bot_token and file_id) else ""
+    
+    # Fórmula do Google Sheets para criar link clicável e amigável na planilha
+    formula_link = f'=HYPERLINK("{link_telegram}"; "Ver Comprovante")' if link_telegram else "Armazenado no Telegram"
     
     row = [
         str(data.get("data", "Não Informado")),
@@ -254,13 +258,28 @@ def append_to_sheet_telegram(data: dict, file_id: str = "") -> int:
         str(data.get("categoria", "Não Informado")),
         str(data.get("pagamento", "Não Informado")),
         float(data.get("valor", 0.0)),
-        ref_telegram  # 7ª coluna: Referência no Telegram
+        formula_link  # 7ª coluna: Link do Comprovante no Telegram
     ]
-    worksheet.append_row(row)
+    
+    try:
+        worksheet.append_row(row, value_input_option='USER_ENTERED')
+    except Exception as e_user_entered:
+        logger.warning(f"Tentativa com USER_ENTERED falhou ({e_user_entered}). Tentando formato compatível...")
+        if link_telegram:
+            row[6] = f'=HYPERLINK("{link_telegram}", "Ver Comprovante")'
+            try:
+                worksheet.append_row(row, value_input_option='USER_ENTERED')
+            except Exception:
+                row[6] = link_telegram
+                worksheet.append_row(row)
+        else:
+            worksheet.append_row(row)
+
     return len(worksheet.get_all_values())
 
-# Alias para compatibilidade
-append_to_sheet = append_to_sheet_telegram
+# Aliases para compatibilidade total
+append_to_sheet_telegram = append_to_sheet_com_link_telegram
+append_to_sheet = append_to_sheet_com_link_telegram
 
 def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, file_id: str, lock_key: str):
     """
@@ -353,11 +372,15 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             # Marca o status de gravação antes de iniciar o append para bloquear requisições paralelas
             log_entry["status_sheets"] = "Gravando na Planilha..."
 
-            # 5. Salva na planilha com os dados extraídos e a referência do Telegram
+            # 5. Salva na planilha com os dados extraídos e a fórmula de link do Telegram
             try:
-                total_linhas = append_to_sheet_telegram(extracted_data, file_id)
+                bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
+                link_telegram = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}" if (bot_token and file_id) else ""
+                log_entry["link_telegram"] = link_telegram
+                
+                total_linhas = append_to_sheet_com_link_telegram(extracted_data, file_id)
                 log_entry["status_sheets"] = "Enviado com Sucesso"
-                log_entry["detalhes"] += f" | Linha registrada: {total_linhas} | Armazenado no Telegram"
+                log_entry["detalhes"] += f" | Linha registrada: {total_linhas} | Link Telegram: OK"
             except Exception as e_sheets:
                 log_entry["status_sheets"] = "Falha no Envio"
                 log_entry["erro"] = f"Erro Google Sheets: {str(e_sheets)}"
@@ -490,9 +513,13 @@ def dashboard_logs_page():
 
             erro_html = f'<div class="error-msg">{log.get("erro")}</div>' if log.get("erro") else ""
 
-            # Referência da foto no Telegram
-            ref_origem = log.get("origem_foto", "Telegram")
-            origem_html = f'<span class="badge-telegram">💬 {ref_origem}</span>'
+            # Referência ou Link direto da foto no Telegram
+            link_tg = log.get("link_telegram")
+            if link_tg:
+                origem_html = f'<a href="{link_tg}" target="_blank" rel="noopener noreferrer" class="badge-telegram" style="color:#0284c7; text-decoration:none; font-weight:700;">🔗 Ver Comprovante</a>'
+            else:
+                ref_origem = log.get("origem_foto", "Telegram")
+                origem_html = f'<span class="badge-telegram">💬 {ref_origem}</span>'
 
             rows_html += f"""
             <tr>
