@@ -729,6 +729,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             log_entry["pagamento"] = extracted_data.get("pagamento", "Não Informado")
             log_entry["valor"] = float(extracted_data.get("valor", 0.0))
             log_entry["data_comprovante"] = extracted_data.get("data", "")
+            log_entry["itens"] = extracted_data.get("itens", [])
             log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
 
         except Exception as e_gemini:
@@ -958,97 +959,48 @@ def logout_get():
 def dashboard_logs_page(request: Request):
     if not is_authenticated(request):
         return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+    
     total_recebidos = len(processing_logs)
     sucessos_sheets = sum(1 for log in processing_logs if log.get("status_sheets") == "Enviado com Sucesso")
-    falhas_sheets = sum(1 for log in processing_logs if "Falha" in log.get("status_sheets", "") or "Erro" in log.get("status_sheets", ""))
     total_valor = sum(log.get("valor", 0.0) for log in processing_logs if log.get("status_sheets") == "Enviado com Sucesso")
+    media_valor = (total_valor / sucessos_sheets) if sucessos_sheets > 0 else 0.0
 
     # Status de configurações
     sheets_ok = bool(SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON)
     gemini_ok = bool(GEMINI_KEYS)
     telegram_ok = bool(TELEGRAM_BOT_TOKEN)
 
-    # Geração das linhas da tabela
-    rows_html = ""
-    if not processing_logs:
-        rows_html = """
-        <tr>
-            <td colspan="8" class="empty-state">
-                <div style="padding: 40px 20px; text-align: center; color: #64748b;">
-                    <div style="font-size: 32px; margin-bottom: 8px;">📋</div>
-                    <div style="font-weight: 600; font-size: 15px; color: #334155;">Nenhum comprovante processado até o momento</div>
-                    <div style="font-size: 13px; margin-top: 4px;">Envie uma foto de nota fiscal, cupom ou recibo no Telegram para ver o registro em tempo real.</div>
-                </div>
-            </td>
-        </tr>
-        """
-    else:
-        for log in processing_logs:
-            st = log.get("status_sheets", "")
-            is_success = st == "Enviado com Sucesso"
-            is_dup = "Duplicidade" in st or "Ignorado" in st
-            is_processing = "Gravando" in st or "Processando" in st or "Pendente" in st
-
-            if is_success:
-                status_badge = '<span class="badge badge-success">✓ Gravado na Planilha</span>'
-            elif is_dup:
-                status_badge = '<span class="badge badge-warning">⚠️ Ignorado (Duplicado)</span>'
-            elif is_processing:
-                status_badge = f'<span class="badge badge-info">⏳ {st}</span>'
-            else:
-                status_badge = f'<span class="badge badge-error">✕ {st}</span>'
-
-            erro_html = f'<div class="error-msg">{log.get("erro")}</div>' if log.get("erro") else ""
-
-            # Referência ou Link direto da foto no Telegram
-            link_tg = log.get("link_telegram")
-            if link_tg and link_tg.startswith("http"):
-                origem_html = f'<a href="{link_tg}" target="_blank" rel="noopener noreferrer" class="badge-telegram" style="color:#0284c7; text-decoration:none; font-weight:700;">🖼️ Ver Imagem</a>'
-            else:
-                ref_origem = log.get("origem_foto", "Telegram")
-                origem_html = f'<span class="badge-telegram">💬 {ref_origem}</span>'
-
-            aba_nome = log.get("aba_planilha") or "Mensal"
-            aba_badge = f'<span class="pill-category" style="background:#e0f2fe; color:#0369a1; border:1px solid #bae6fd; font-weight:700;">{aba_nome}</span>'
-
-            obs_text = log.get("observacao")
-            obs_html = f'<div style="font-size:11px; color:#475569; margin-top:3px; font-style:italic;">💬 Obs: {obs_text}</div>' if obs_text else ""
-
-            rows_html += f"""
-            <tr>
-                <td class="font-mono text-muted">{log.get("timestamp")}</td>
-                <td class="font-bold">{log.get("estabelecimento")}{obs_html}</td>
-                <td><span class="pill-category">{log.get("categoria")}</span></td>
-                <td>{log.get("tipo_documento")} / {log.get("pagamento")}</td>
-                <td class="text-center">{aba_badge}</td>
-                <td class="font-mono font-bold text-right">R$ {log.get("valor", 0.0):.2f}</td>
-                <td class="text-center">{origem_html}</td>
-                <td class="text-center">{status_badge}{erro_html}</td>
-                <td class="text-muted font-mono">{log.get("username")}</td>
-            </tr>
-            """
-
     sheet_id_display = "Não configurada"
     if SPREADSHEET_ID:
-        if len(SPREADSHEET_ID) > 12:
-            sheet_id_display = f"{SPREADSHEET_ID[:6]}...{SPREADSHEET_ID[-6:]}"
-        else:
-            sheet_id_display = SPREADSHEET_ID
+        sheet_id_display = f"{SPREADSHEET_ID[:6]}...{SPREADSHEET_ID[-6:]}" if len(SPREADSHEET_ID) > 12 else SPREADSHEET_ID
 
-    html_content = f"""<!DOCTYPE html>
-<html lang="pt-BR">
+    # Serializa todos os logs para interatividade no cliente (com os itens discriminados)
+    raw_logs_json = json.dumps(processing_logs, ensure_ascii=False)
+
+    template = """<!DOCTYPE html>
+<html lang="pt-BR" class="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Log de Auditoria & Google Sheets - Bot Financeiro</title>
-    <meta http-equiv="refresh" content="15">
+    <title>Painel Executivo de Auditoria Fiscal — Bot Telegram & Google Sheets</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script>
+        (function() {
+            const savedTheme = localStorage.getItem('theme');
+            if (savedTheme === 'light') {
+                document.documentElement.classList.remove('dark');
+            } else {
+                document.documentElement.classList.add('dark');
+            }
+        })();
+    </script>
     <style>
-        :root {{
+        :root {
             --bg-color: #f8fafc;
             --surface-color: #ffffff;
+            --surface-hover: #f1f5f9;
             --border-color: #e2e8f0;
             --text-main: #0f172a;
             --text-muted: #64748b;
@@ -1059,153 +1011,332 @@ def dashboard_logs_page(request: Request):
             --danger-light: #fef2f2;
             --info: #0284c7;
             --info-light: #f0f9ff;
-            --telegram-color: #229ED9;
-            --telegram-light: #e6f6fd;
-        }}
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
+            --telegram-color: #0284c7;
+            --telegram-light: #e0f2fe;
+            --card-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            --input-bg: #ffffff;
+            --modal-overlay: rgba(15, 23, 42, 0.6);
+        }
+
+        .dark {
+            --bg-color: #0b0f19;
+            --surface-color: #111827;
+            --surface-hover: #1f2937;
+            --border-color: #1f2937;
+            --text-main: #f9fafb;
+            --text-muted: #9ca3af;
+            --primary: #10b981;
+            --primary-dark: #34d399;
+            --primary-light: rgba(16, 185, 129, 0.15);
+            --danger: #f87171;
+            --danger-light: rgba(239, 68, 68, 0.15);
+            --info: #38bdf8;
+            --info-light: rgba(2, 132, 199, 0.15);
+            --telegram-color: #38bdf8;
+            --telegram-light: rgba(56, 189, 248, 0.15);
+            --card-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            --input-bg: #1f2937;
+            --modal-overlay: rgba(0, 0, 0, 0.8);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
             font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
             background-color: var(--bg-color);
             color: var(--text-main);
             min-height: 100vh;
-            padding: 24px;
-        }}
-        .container {{
-            max-width: 1250px;
+            padding: 24px 16px;
+            transition: background-color 0.2s, color 0.2s;
+        }
+        .container {
+            max-width: 1300px;
             margin: 0 auto;
-        }}
-        header {{
+        }
+
+        header {
             background: var(--surface-color);
             border: 1px solid var(--border-color);
             border-radius: 16px;
-            padding: 24px;
-            margin-bottom: 24px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+            padding: 20px 24px;
+            margin-bottom: 20px;
+            box-shadow: var(--card-shadow);
             display: flex;
             flex-wrap: wrap;
             justify-content: space-between;
             align-items: center;
             gap: 16px;
-        }}
-        .title-group h1 {{
+        }
+        .brand-zone {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .brand-icon {
+            width: 44px;
+            height: 44px;
+            background: var(--primary-light);
+            color: var(--primary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+        }
+        .title-group h1 {
             font-size: 20px;
             font-weight: 800;
             color: var(--text-main);
+            letter-spacing: -0.3px;
+        }
+        .title-group p {
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+
+        .top-actions {
             display: flex;
             align-items: center;
             gap: 10px;
-        }}
-        .title-group p {{
-            font-size: 13px;
-            color: var(--text-muted);
-            margin-top: 4px;
-        }}
-        .status-indicators {{
-            display: flex;
-            gap: 10px;
             flex-wrap: wrap;
-        }}
-        .indicator {{
+        }
+
+        .status-indicators {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .indicator {
             display: flex;
             align-items: center;
             gap: 6px;
-            font-size: 12px;
-            font-weight: 600;
-            padding: 6px 12px;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 6px 10px;
             border-radius: 8px;
-            background: #f1f5f9;
-        }}
-        .indicator.active {{
+            background: var(--surface-hover);
+            border: 1px solid var(--border-color);
+        }
+        .indicator.active {
             background: var(--primary-light);
             color: var(--primary-dark);
-        }}
-        .indicator.active-telegram {{
+        }
+        .indicator.active-telegram {
             background: var(--telegram-light);
             color: var(--telegram-color);
-        }}
-        .indicator.inactive {{
+        }
+        .indicator.inactive {
             background: var(--danger-light);
             color: var(--danger);
-        }}
-        .dot {{
-            width: 8px;
-            height: 8px;
+        }
+        .dot {
+            width: 7px;
+            height: 7px;
             border-radius: 50%;
             background: currentColor;
-        }}
-        .kpi-grid {{
+        }
+
+        .btn-action {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            padding: 8px 14px;
+            font-size: 12px;
+            font-weight: 600;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.2s;
+            color: var(--text-main);
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            text-decoration: none;
+        }
+        .btn-action:hover {
+            background: var(--surface-hover);
+        }
+        .btn-primary {
+            background: var(--primary);
+            color: #ffffff;
+            border-color: var(--primary-dark);
+        }
+        .btn-primary:hover {
+            background: var(--primary-dark);
+        }
+
+        .kpi-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 16px;
-            margin-bottom: 24px;
-        }}
-        .kpi-card {{
+            margin-bottom: 20px;
+        }
+        .kpi-card {
             background: var(--surface-color);
             border: 1px solid var(--border-color);
-            border-radius: 12px;
+            border-radius: 14px;
             padding: 18px 20px;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.02);
-        }}
-        .kpi-card .label {{
+            box-shadow: var(--card-shadow);
+        }
+        .kpi-card .label {
             font-size: 11px;
             font-weight: 700;
             color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.5px;
-        }}
-        .kpi-card .value {{
-            font-size: 26px;
+        }
+        .kpi-card .value {
+            font-size: 24px;
             font-weight: 800;
             font-family: 'JetBrains Mono', monospace;
-            margin-top: 4px;
+            font-variant-numeric: tabular-nums;
+            margin-top: 6px;
             color: var(--text-main);
-        }}
-        .kpi-card .subtext {{
+        }
+        .kpi-card .subtext {
             font-size: 11px;
             color: var(--text-muted);
             margin-top: 4px;
-        }}
-        .table-card {{
+        }
+
+        .category-card {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: var(--card-shadow);
+        }
+        .category-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 14px;
+        }
+        .category-header h3 {
+            font-size: 14px;
+            font-weight: 700;
+        }
+        .category-progress-bar {
+            display: flex;
+            height: 12px;
+            border-radius: 6px;
+            overflow: hidden;
+            background: var(--surface-hover);
+            margin-bottom: 14px;
+        }
+        .category-progress-segment {
+            height: 100%;
+            transition: width 0.4s ease;
+        }
+        .category-legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px 20px;
+            font-size: 12px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            padding: 2px 6px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+        .legend-item:hover {
+            background: var(--surface-hover);
+        }
+        .legend-color {
+            width: 100px;
+            height: 10px;
+            border-radius: 3px;
+        }
+
+        .filter-card {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            padding: 16px 20px;
+            margin-bottom: 20px;
+            box-shadow: var(--card-shadow);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .search-box {
+            flex: 1;
+            min-width: 240px;
+            position: relative;
+        }
+        .search-box input {
+            width: 100%;
+            padding: 10px 14px 10px 36px;
+            border-radius: 10px;
+            border: 1px solid var(--border-color);
+            background: var(--input-bg);
+            color: var(--text-main);
+            font-size: 13px;
+            outline: none;
+            transition: border 0.2s;
+        }
+        .search-box input:focus {
+            border-color: var(--primary);
+        }
+        .search-icon {
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+
+        .filter-selects {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .select-field {
+            padding: 10px 14px;
+            border-radius: 10px;
+            border: 1px solid var(--border-color);
+            background: var(--input-bg);
+            color: var(--text-main);
+            font-size: 12px;
+            font-weight: 600;
+            outline: none;
+            cursor: pointer;
+        }
+
+        .table-card {
             background: var(--surface-color);
             border: 1px solid var(--border-color);
             border-radius: 16px;
             overflow: hidden;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-        }}
-        .table-header {{
+            box-shadow: var(--card-shadow);
+        }
+        .table-header-title {
             padding: 16px 20px;
             border-bottom: 1px solid var(--border-color);
             display: flex;
             justify-content: space-between;
             align-items: center;
-            background: #ffffff;
-        }}
-        .table-header h2 {{
+        }
+        .table-header-title h2 {
             font-size: 15px;
             font-weight: 700;
-        }}
-        .refresh-btn {{
-            background: #ffffff;
-            border: 1px solid var(--border-color);
-            padding: 6px 14px;
-            font-size: 12px;
-            font-weight: 600;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.2s;
-            color: var(--text-main);
-        }}
-        .refresh-btn:hover {{
-            background: #f1f5f9;
-        }}
-        table {{
+        }
+
+        table {
             width: 100%;
             border-collapse: collapse;
             text-align: left;
             font-size: 13px;
-        }}
-        th {{
-            background: #f8fafc;
+        }
+        th {
+            background: var(--surface-hover);
             padding: 12px 16px;
             font-weight: 700;
             font-size: 11px;
@@ -1213,73 +1344,135 @@ def dashboard_logs_page(request: Request):
             letter-spacing: 0.5px;
             color: var(--text-muted);
             border-bottom: 1px solid var(--border-color);
-        }}
-        td {{
+            cursor: pointer;
+            user-select: none;
+            white-space: nowrap;
+        }
+        th:hover {
+            color: var(--text-main);
+        }
+        td {
             padding: 14px 16px;
             border-bottom: 1px solid var(--border-color);
-            color: #1e293b;
-        }}
-        tr:hover td {{
-            background-color: #f8fafc;
-        }}
-        .font-mono {{ font-family: 'JetBrains Mono', monospace; }}
-        .font-bold {{ font-weight: 700; }}
-        .text-right {{ text-align: right; }}
-        .text-center {{ text-align: center; }}
-        .text-muted {{ color: var(--text-muted); }}
-        .badge {{
+        }
+        tr:hover td {
+            background-color: var(--surface-hover);
+        }
+
+        .font-mono { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
+        .font-bold { font-weight: 700; }
+        .text-right { text-align: right; }
+        .text-center { text-align: center; }
+        .text-muted { color: var(--text-muted); }
+
+        .badge {
             display: inline-block;
             padding: 4px 10px;
             border-radius: 6px;
             font-size: 11px;
             font-weight: 700;
-        }}
-        .badge-success {{
-            background: var(--primary-light);
-            color: var(--primary-dark);
-            border: 1px solid #a7f3d0;
-        }}
-        .badge-error {{
-            background: var(--danger-light);
-            color: var(--danger);
-            border: 1px solid #fecaca;
-        }}
-        .badge-warning {{
-            background: #fffbeb;
-            color: #b45309;
-            border: 1px solid #fde68a;
-        }}
-        .badge-info {{
-            background: var(--info-light);
-            color: var(--info);
-            border: 1px solid #bae6fd;
-        }}
-        .badge-telegram {{
-            display: inline-block;
-            background: var(--telegram-light);
-            color: #0369a1;
-            font-size: 11px;
-            font-weight: 600;
-            padding: 3px 8px;
+        }
+        .badge-success { background: var(--primary-light); color: var(--primary-dark); border: 1px solid rgba(16,185,129,0.3); }
+        .badge-error { background: var(--danger-light); color: var(--danger); border: 1px solid rgba(239,68,68,0.3); }
+        .badge-warning { background: rgba(245, 158, 11, 0.15); color: #d97706; border: 1px solid rgba(245, 158, 11, 0.3); }
+        .badge-info { background: var(--info-light); color: var(--info); border: 1px solid rgba(2, 132, 199, 0.3); }
+
+        .pill-category {
+            background: var(--surface-hover);
+            color: var(--text-main);
+            padding: 4px 10px;
             border-radius: 6px;
-            border: 1px solid #bae6fd;
-            font-family: 'JetBrains Mono', monospace;
-        }}
-        .pill-category {{
-            background: #f1f5f9;
-            color: #334155;
-            padding: 3px 8px;
-            border-radius: 4px;
             font-size: 11px;
+            font-weight: 700;
+            border: 1px solid var(--border-color);
+        }
+
+        .pagination-bar {
+            padding: 14px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top: 1px solid var(--border-color);
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .modal-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: var(--modal-overlay);
+            backdrop-filter: blur(4px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s;
+            padding: 20px;
+        }
+        .modal-overlay.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .modal-card {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            width: 100%;
+            max-width: 650px;
+            max-height: 90vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+            padding: 28px;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 20px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 16px;
+        }
+        .modal-header h2 { font-size: 18px; font-weight: 800; }
+        .modal-close {
+            background: var(--surface-hover);
+            border: none;
+            width: 32px; height: 32px;
+            border-radius: 50%;
+            cursor: pointer;
+            color: var(--text-muted);
+            font-size: 18px;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .modal-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        .modal-field label {
+            font-size: 11px;
+            font-weight: 700;
+            color: var(--text-muted);
+            text-transform: uppercase;
+        }
+        .modal-field p {
+            font-size: 14px;
             font-weight: 600;
-        }}
-        .error-msg {{
-            font-size: 11px;
-            color: var(--danger);
             margin-top: 4px;
-            font-family: 'JetBrains Mono', monospace;
-        }}
-        footer {{
+        }
+
+        .items-table-container {
+            margin-top: 16px;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        .items-table-container th { font-size: 10px; background: var(--surface-hover); }
+        .items-table-container td { padding: 10px 14px; font-size: 12px; }
+
+        footer {
             margin-top: 24px;
             text-align: center;
             font-size: 12px;
@@ -1289,88 +1482,624 @@ def dashboard_logs_page(request: Request):
             align-items: center;
             flex-wrap: wrap;
             gap: 8px;
-        }}
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <div class="title-group">
-                <h1>📊 Monitor de Auditoria & Google Sheets</h1>
-                <p>Verificação em tempo real dos comprovantes recebidos e gravados na planilha</p>
+            <div class="brand-zone">
+                <div class="brand-icon">📊</div>
+                <div class="title-group">
+                    <h1>Auditor Fiscal AI</h1>
+                    <p>Painel de Monitoramento & Integração com Google Sheets</p>
+                </div>
             </div>
-            <div class="status-indicators">
-                <div class="indicator {'active' if sheets_ok else 'inactive'}">
-                    <span class="dot"></span> Sheets {'Conectado' if sheets_ok else 'Pendente'}
+
+            <div class="top-actions">
+                <div class="status-indicators">
+                    <div class="indicator %SHEETS_OK_CLASS%">
+                        <span class="dot"></span> Sheets %SHEETS_OK_TEXT%
+                    </div>
+                    <div class="indicator %GEMINI_OK_CLASS%">
+                        <span class="dot"></span> Gemini AI %GEMINI_OK_TEXT%
+                    </div>
+                    <div class="indicator %TELEGRAM_OK_CLASS%">
+                        <span class="dot"></span> Telegram %TELEGRAM_OK_TEXT%
+                    </div>
                 </div>
-                <div class="indicator {'active' if gemini_ok else 'inactive'}">
-                    <span class="dot"></span> Gemini AI {'Ativo' if gemini_ok else 'Sem Chave'}
-                </div>
-                <div class="indicator {'active-telegram' if telegram_ok else 'inactive'}">
-                    <span class="dot"></span> Telegram {'Pronto' if telegram_ok else 'Sem Token'}
-                </div>
+
+                <button class="btn-action" onclick="toggleTheme()" id="themeToggleBtn">
+                    🌙 Tema Escuro
+                </button>
+                <button class="btn-action" onclick="window.location.reload()">
+                    ↻ Atualizar
+                </button>
+                <a href="/logout" class="btn-action" style="color: var(--danger); border-color: rgba(239,68,68,0.3);">
+                    🚪 Sair
+                </a>
             </div>
         </header>
 
+        <!-- KPI Cards Grid -->
         <div class="kpi-grid">
             <div class="kpi-card">
-                <div class="label">Gravados na Planilha</div>
-                <div class="value" style="color: var(--primary-dark);">{sucessos_sheets}</div>
-                <div class="subtext">Sincronizados com o Google Sheets</div>
-            </div>
-            <div class="kpi-card">
-                <div class="label">Total Processados</div>
-                <div class="value">{total_recebidos}</div>
-                <div class="subtext">Comprovantes via Telegram</div>
-            </div>
-            <div class="kpi-card">
                 <div class="label">Valor Total Registrado</div>
-                <div class="value">R$ {total_valor:.2f}</div>
-                <div class="subtext">Soma das notas válidas</div>
+                <div class="value" style="color: var(--primary);" id="kpiTotalValor">R$ %TOTAL_VALOR%</div>
+                <div class="subtext">Soma dos lançamentos válidos</div>
+            </div>
+            <div class="kpi-card">
+                <div class="label">Comprovantes Gravados</div>
+                <div class="value" id="kpiSucessos">%SUCESSOS%</div>
+                <div class="subtext">Sincronizados na Planilha</div>
+            </div>
+            <div class="kpi-card">
+                <div class="label">Média por Comprovante</div>
+                <div class="value" id="kpiMedia">R$ %MEDIA_VALOR%</div>
+                <div class="subtext">Ticket médio dos gastos</div>
             </div>
             <div class="kpi-card">
                 <div class="label">Planilha Conectada</div>
-                <div class="value font-mono" style="font-size: 14px; margin-top: 8px;">{sheet_id_display}</div>
+                <div class="value font-mono" style="font-size: 15px; margin-top: 8px;">%SHEET_ID_DISPLAY%</div>
                 <div class="subtext">Abas Mensais Automáticas</div>
             </div>
         </div>
 
+        <!-- Dashboard da Distribuição de Gastos por Categoria -->
+        <div class="category-card">
+            <div class="category-header">
+                <h3>📌 Distribuição dos Gastos por Categoria</h3>
+                <span class="text-muted" style="font-size: 12px;" id="catTotalText">Total: R$ %TOTAL_VALOR%</span>
+            </div>
+            <div class="category-progress-bar" id="categoryProgressBar">
+                <!-- Segments rendered dynamically via JavaScript -->
+            </div>
+            <div class="category-legend" id="categoryLegend">
+                <!-- Legend rendered dynamically via JavaScript -->
+            </div>
+        </div>
+
+        <!-- Filtros e Barra de Ações -->
+        <div class="filter-card">
+            <div class="search-box">
+                <span class="search-icon">🔍</span>
+                <input type="text" id="searchInput" placeholder="Buscar por estabelecimento, responsável, observação ou categoria..." oninput="onFilterChange()">
+            </div>
+
+            <div class="filter-selects">
+                <select id="abaSelect" class="select-field" onchange="onFilterChange()">
+                    <option value="">Todas as Abas</option>
+                </select>
+
+                <select id="categoriaSelect" class="select-field" onchange="onFilterChange()">
+                    <option value="">Todas as Categorias</option>
+                </select>
+
+                <select id="sortSelect" class="select-field" onchange="onFilterChange()">
+                    <option value="timestamp_desc">Data (Mais recente)</option>
+                    <option value="timestamp_asc">Data (Mais antiga)</option>
+                    <option value="valor_desc">Valor (Maior -> Menor)</option>
+                    <option value="valor_asc">Valor (Menor -> Maior)</option>
+                    <option value="estabelecimento_asc">Estabelecimento (A-Z)</option>
+                </select>
+
+                <button class="btn-action btn-primary" onclick="exportFilteredCSV()">
+                    📥 Exportar CSV
+                </button>
+            </div>
+        </div>
+
+        <!-- Tabela Principal de Registros -->
         <div class="table-card">
-            <div class="table-header">
-                <h2>Histórico de Envios para a Planilha do Google</h2>
-                <div style="display: flex; gap: 8px; align-items: center;">
-                    <a href="/logout" class="refresh-btn" style="color: #ef4444; border-color: #fecaca; text-decoration: none; display: inline-flex; align-items: center; gap: 4px;">🚪 Sair</a>
-                    <button class="refresh-btn" onclick="window.location.reload()">↻ Atualizar (Auto 15s)</button>
-                </div>
+            <div class="table-header-title">
+                <h2>Histórico de Envios & Comprovantes Fiscais</h2>
+                <span class="text-muted" style="font-size: 12px;" id="rowCountInfo">Mostrando 0 registros</span>
             </div>
             <div style="overflow-x: auto;">
                 <table>
                     <thead>
                         <tr>
-                            <th>Data/Hora</th>
-                            <th>Estabelecimento</th>
-                            <th>Categoria</th>
-                            <th>Doc / Pagamento</th>
-                            <th class="text-center">Aba Mensal</th>
-                            <th class="text-right">Valor</th>
+                            <th onclick="setSort('timestamp')">Data/Hora <span id="sort-timestamp">▼</span></th>
+                            <th onclick="setSort('estabelecimento')">Estabelecimento <span id="sort-estabelecimento"></span></th>
+                            <th onclick="setSort('categoria')">Categoria <span id="sort-categoria"></span></th>
+                            <th>Tipo / Pagamento</th>
+                            <th class="text-center" onclick="setSort('aba_planilha')">Aba Mensal <span id="sort-aba_planilha"></span></th>
+                            <th class="text-right" onclick="setSort('valor')">Valor (R$) <span id="sort-valor"></span></th>
                             <th class="text-center">Comprovante</th>
-                            <th class="text-center">Status Google Sheets</th>
-                            <th>Usuário Telegram</th>
+                            <th class="text-center">Status Planilha</th>
+                            <th>Responsável</th>
+                            <th class="text-center">Ação</th>
                         </tr>
                     </thead>
-                    <tbody>
-                        {rows_html}
+                    <tbody id="tableBody">
+                        <!-- Table rows populated dynamically -->
                     </tbody>
                 </table>
+            </div>
+
+            <div class="pagination-bar">
+                <div id="pageInfoText">Página 1 de 1</div>
+                <div style="display: flex; gap: 6px;">
+                    <button class="btn-action" id="btnPrevPage" onclick="changePage(-1)">← Anterior</button>
+                    <button class="btn-action" id="btnNextPage" onclick="changePage(1)">Próxima →</button>
+                </div>
             </div>
         </div>
 
         <footer>
             <div>Auditor Fiscal AI · Telegram + Google Sheets (Armazenamento Nativo no Telegram)</div>
-            <div>Atualização automática a cada 15 segundos</div>
+            <div>Atualização automática em tempo real</div>
         </footer>
     </div>
+
+    <!-- Modal de Detalhes do Comprovante e Itens -->
+    <div class="modal-overlay" id="detailModal" onclick="if(event.target===this) closeModal()">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div>
+                    <h2 id="modalTitle">Detalhes do Comprovante Fiscal</h2>
+                    <p class="text-muted" style="font-size: 12px; margin-top: 2px;" id="modalSubtitle">Lançamento processado pelo Gemini AI</p>
+                </div>
+                <button class="modal-close" onclick="closeModal()">✕</button>
+            </div>
+
+            <div class="modal-grid" id="modalMetadataGrid">
+                <!-- Metadata rendered dynamically -->
+            </div>
+
+            <div style="margin-top: 16px;">
+                <h3 style="font-size: 14px; font-weight: 700; margin-bottom: 8px;">🛒 Itens Comprados / Discriminados na Nota</h3>
+                <div class="items-table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Descrição do Item</th>
+                                <th class="text-center">Qtd</th>
+                                <th class="text-right">Valor Total (R$)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="modalItemsTableBody">
+                            <!-- Items table rendered dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div style="margin-top: 24px; display: flex; justify-content: space-between; align-items: center;">
+                <div id="modalLinkContainer"></div>
+                <button class="btn-action" onclick="closeModal()">Fechar Visualização</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const rawLogs = %RAW_LOGS_JSON%;
+        
+        let filteredLogs = [...rawLogs];
+        let currentSortField = 'timestamp';
+        let currentSortOrder = 'desc';
+        let currentPage = 1;
+        const pageSize = 15;
+
+        const CATEGORY_COLORS = {
+            'Alimentação': '#10b981',
+            'Veículo': '#38bdf8',
+            'Saúde': '#f43f5e',
+            'Moradia': '#a855f7',
+            'Transporte': '#f59e0b',
+            'Lazer': '#ec4899',
+            'Educação': '#6366f1',
+            'Outros': '#64748b'
+        };
+
+        function updateThemeButtonText() {
+            const isDark = document.documentElement.classList.contains('dark');
+            const btn = document.getElementById('themeToggleBtn');
+            if (btn) {
+                btn.innerHTML = isDark ? '☀️ Tema Claro' : '🌙 Tema Escuro';
+            }
+        }
+
+        function toggleTheme() {
+            const isDark = document.documentElement.classList.contains('dark');
+            if (isDark) {
+                document.documentElement.classList.remove('dark');
+                localStorage.setItem('theme', 'light');
+            } else {
+                document.documentElement.classList.add('dark');
+                localStorage.setItem('theme', 'dark');
+            }
+            updateThemeButtonText();
+        }
+
+        function initSelectOptions() {
+            const abas = new Set();
+            const categorias = new Set();
+
+            rawLogs.forEach(log => {
+                if (log.aba_planilha) abas.add(log.aba_planilha);
+                if (log.categoria && log.categoria !== '-') categorias.add(log.categoria);
+            });
+
+            const abaSelect = document.getElementById('abaSelect');
+            abas.forEach(aba => {
+                const opt = document.createElement('option');
+                opt.value = aba;
+                opt.textContent = `Aba: ${aba}`;
+                abaSelect.appendChild(opt);
+            });
+
+            const catSelect = document.getElementById('categoriaSelect');
+            categorias.forEach(cat => {
+                const opt = document.createElement('option');
+                opt.value = cat;
+                opt.textContent = `Categoria: ${cat}`;
+                catSelect.appendChild(opt);
+            });
+        }
+
+        function onFilterChange() {
+            const searchVal = document.getElementById('searchInput').value || '';
+            const searchText = searchVal.trim().toLowerCase();
+            const selectedAba = document.getElementById('abaSelect').value;
+            const selectedCat = document.getElementById('categoriaSelect').value;
+            const sortVal = document.getElementById('sortSelect').value;
+
+            if (sortVal) {
+                const parts = sortVal.split('_');
+                currentSortField = parts[0];
+                currentSortOrder = parts[1] || 'desc';
+            }
+
+            filteredLogs = rawLogs.filter(log => {
+                const matchSearch = !searchText || 
+                    (log.estabelecimento || '').toLowerCase().includes(searchText) ||
+                    (log.username || '').toLowerCase().includes(searchText) ||
+                    (log.categoria || '').toLowerCase().includes(searchText) ||
+                    (log.observacao || '').toLowerCase().includes(searchText) ||
+                    (log.data_comprovante || '').toLowerCase().includes(searchText);
+
+                const matchAba = !selectedAba || log.aba_planilha === selectedAba;
+                const matchCat = !selectedCat || log.categoria === selectedCat;
+
+                return matchSearch && matchAba && matchCat;
+            });
+
+            // Ordenação
+            filteredLogs.sort((a, b) => {
+                let valA = a[currentSortField] || '';
+                let valB = b[currentSortField] || '';
+
+                if (currentSortField === 'valor') {
+                    valA = parseFloat(valA) || 0;
+                    valB = parseFloat(valB) || 0;
+                } else if (currentSortField === 'timestamp') {
+                    valA = new Date(valA).getTime() || 0;
+                    valB = new Date(b.timestamp).getTime() || 0;
+                }
+
+                if (valA < valB) return currentSortOrder === 'asc' ? -1 : 1;
+                if (valA > valB) return currentSortOrder === 'asc' ? 1 : -1;
+                return 0;
+            });
+
+            currentPage = 1;
+            renderDashboard();
+        }
+
+        function setSort(field) {
+            if (currentSortField === field) {
+                currentSortOrder = currentSortOrder === 'asc' ? 'desc' : 'asc';
+            } else {
+                currentSortField = field;
+                currentSortOrder = 'desc';
+            }
+            document.getElementById('sortSelect').value = `${currentSortField}_${currentSortOrder}`;
+            onFilterChange();
+        }
+
+        function renderDashboard() {
+            renderCategoryDistribution();
+            renderTable();
+            renderKPIs();
+        }
+
+        function renderKPIs() {
+            const sucessos = filteredLogs.filter(l => l.status_sheets === 'Enviado com Sucesso');
+            const totalVal = sucessos.reduce((sum, l) => sum + (parseFloat(l.valor) || 0), 0);
+            const media = sucessos.length > 0 ? (totalVal / sucessos.length) : 0;
+
+            document.getElementById('kpiTotalValor').textContent = `R$ ${totalVal.toFixed(2)}`;
+            document.getElementById('kpiSucessos').textContent = sucessos.length;
+            document.getElementById('kpiMedia').textContent = `R$ ${media.toFixed(2)}`;
+        }
+
+        function renderCategoryDistribution() {
+            const totaisPorCat = {};
+            let totalGeral = 0;
+
+            filteredLogs.forEach(log => {
+                if (log.status_sheets === 'Enviado com Sucesso') {
+                    const cat = log.categoria && log.categoria !== '-' ? log.categoria : 'Outros';
+                    const val = parseFloat(log.valor) || 0;
+                    totaisPorCat[cat] = (totaisPorCat[cat] || 0) + val;
+                    totalGeral += val;
+                }
+            });
+
+            document.getElementById('catTotalText').textContent = `Total Filtrado: R$ ${totalGeral.toFixed(2)}`;
+
+            const progressBar = document.getElementById('categoryProgressBar');
+            const legend = document.getElementById('categoryLegend');
+            progressBar.innerHTML = '';
+            legend.innerHTML = '';
+
+            if (totalGeral === 0) {
+                progressBar.innerHTML = '<div style="width:100%; height:100%; background:var(--surface-hover);"></div>';
+                legend.innerHTML = '<span class="text-muted" style="font-size:12px;">Nenhum gasto gravado no filtro selecionado.</span>';
+                return;
+            }
+
+            const sortedCats = Object.entries(totaisPorCat).sort((a, b) => b[1] - a[1]);
+
+            sortedCats.forEach(([cat, val]) => {
+                const pct = (val / totalGeral) * 100;
+                const color = CATEGORY_COLORS[cat] || '#64748b';
+
+                const seg = document.createElement('div');
+                seg.className = 'category-progress-segment';
+                seg.style.width = `${pct}%`;
+                seg.style.backgroundColor = color;
+                seg.title = `${cat}: R$ ${val.toFixed(2)} (${pct.toFixed(1)}%)`;
+                progressBar.appendChild(seg);
+
+                const legItem = document.createElement('div');
+                legItem.className = 'legend-item';
+                legItem.onclick = () => {
+                    document.getElementById('categoriaSelect').value = cat;
+                    onFilterChange();
+                };
+                legItem.innerHTML = `
+                    <div class="legend-color" style="background-color: ${color};"></div>
+                    <span style="font-weight:600;">${cat}</span>
+                    <span class="text-muted">R$ ${val.toFixed(2)} (${pct.toFixed(1)}%)</span>
+                `;
+                legend.appendChild(legItem);
+            });
+        }
+
+        function renderTable() {
+            const tbody = document.getElementById('tableBody');
+            tbody.innerHTML = '';
+
+            const totalRows = filteredLogs.length;
+            document.getElementById('rowCountInfo').textContent = `${totalRows} comprovante(s) no filtro`;
+
+            if (totalRows === 0) {
+                tbody.innerHTML = `
+                <tr>
+                    <td colspan="10" class="text-center" style="padding: 40px; color: var(--text-muted);">
+                        <div style="font-size: 28px; margin-bottom: 6px;">🔍</div>
+                        <div style="font-weight:700;">Nenhum registro encontrado para estes filtros</div>
+                        <div style="font-size:12px; margin-top:4px;">Tente alterar a busca ou selecionar outra aba mensal.</div>
+                    </td>
+                </tr>
+                `;
+                document.getElementById('pageInfoText').textContent = 'Página 0 de 0';
+                document.getElementById('btnPrevPage').disabled = true;
+                document.getElementById('btnNextPage').disabled = true;
+                return;
+            }
+
+            const maxPages = Math.ceil(totalRows / pageSize);
+            if (currentPage > maxPages) currentPage = maxPages;
+            if (currentPage < 1) currentPage = 1;
+
+            const startIndex = (currentPage - 1) * pageSize;
+            const pageLogs = filteredLogs.slice(startIndex, startIndex + pageSize);
+
+            pageLogs.forEach((log) => {
+                const tr = document.createElement('tr');
+
+                const st = log.status_sheets || '';
+                let statusBadge = '';
+                if (st === 'Enviado com Sucesso') {
+                    statusBadge = '<span class="badge badge-success">✓ Gravado</span>';
+                } else if (st.includes('Duplicidade') || st.includes('Ignorado')) {
+                    statusBadge = '<span class="badge badge-warning">⚠️ Ignorado (Duplicado)</span>';
+                } else if (st.includes('Gravando') || st.includes('Processando') || st.includes('Pendente')) {
+                    statusBadge = `<span class="badge badge-info">⏳ ${st}</span>`;
+                } else {
+                    statusBadge = `<span class="badge badge-error">✕ ${st}</span>`;
+                }
+
+                const erroHtml = log.erro ? `<div class="error-msg">${log.erro}</div>` : '';
+
+                let origemHtml = '';
+                if (log.link_telegram && log.link_telegram.startsWith('http')) {
+                    origemHtml = `<a href="${log.link_telegram}" target="_blank" rel="noopener" class="btn-action" style="padding:4px 8px; font-size:11px; color:#0284c7;">🖼️ Ver Imagem</a>`;
+                } else {
+                    origemHtml = `<span class="text-muted" style="font-size:11px;">💬 Telegram</span>`;
+                }
+
+                const abaBadge = `<span class="pill-category">${log.aba_planilha || 'Mensal'}</span>`;
+                const obsHtml = log.observacao ? `<div style="font-size:11px; color:var(--text-muted); font-style:italic; margin-top:2px;">💬 ${log.observacao}</div>` : '';
+
+                tr.innerHTML = `
+                    <td class="font-mono text-muted" style="font-size:12px;">${log.timestamp || '-'}</td>
+                    <td class="font-bold">${log.estabelecimento || '-'}${obsHtml}</td>
+                    <td><span class="pill-category">${log.categoria || '-'}</span></td>
+                    <td style="font-size:12px;">${log.tipo_documento || '-'} / ${log.pagamento || '-'}</td>
+                    <td class="text-center">${abaBadge}</td>
+                    <td class="font-mono font-bold text-right" style="color:var(--text-main);">R$ ${(parseFloat(log.valor) || 0).toFixed(2)}</td>
+                    <td class="text-center">${origemHtml}</td>
+                    <td class="text-center">${statusBadge}${erroHtml}</td>
+                    <td class="text-muted font-mono" style="font-size:12px;">${log.username || '-'}</td>
+                    <td class="text-center">
+                        <button class="btn-action" style="padding:4px 8px; font-size:11px;" onclick="openDetailModal('${log.id}')">
+                            🔍 Detalhes
+                        </button>
+                    </td>
+                `;
+
+                tbody.appendChild(tr);
+            });
+
+            document.getElementById('pageInfoText').textContent = `Página ${currentPage} de ${maxPages} (${totalRows} total)`;
+            document.getElementById('btnPrevPage').disabled = currentPage === 1;
+            document.getElementById('btnNextPage').disabled = currentPage === maxPages;
+        }
+
+        function changePage(delta) {
+            currentPage += delta;
+            renderTable();
+        }
+
+        function openDetailModal(logId) {
+            const log = rawLogs.find(l => l.id === logId);
+            if (!log) return;
+
+            document.getElementById('modalTitle').textContent = log.estabelecimento && log.estabelecimento !== '-' ? log.estabelecimento : 'Comprovante Fiscal';
+            document.getElementById('modalSubtitle').textContent = `Lançado em ${log.timestamp || ''} — Aba: ${log.aba_planilha || 'Mensal'}`;
+
+            const metaGrid = document.getElementById('modalMetadataGrid');
+            metaGrid.innerHTML = `
+                <div class="modal-field">
+                    <label>Valor Total</label>
+                    <p class="font-mono font-bold" style="font-size:20px; color:var(--primary);">R$ ${(parseFloat(log.valor) || 0).toFixed(2)}</p>
+                </div>
+                <div class="modal-field">
+                    <label>Tipo Documento</label>
+                    <p>${log.tipo_documento || '-'}</p>
+                </div>
+                <div class="modal-field">
+                    <label>Categoria</label>
+                    <p>${log.categoria || '-'}</p>
+                </div>
+                <div class="modal-field">
+                    <label>Forma Pagamento</label>
+                    <p>${log.pagamento || '-'}</p>
+                </div>
+                <div class="modal-field">
+                    <label>Data Comprovante</label>
+                    <p class="font-mono">${log.data_comprovante || log.timestamp || '-'}</p>
+                </div>
+                <div class="modal-field">
+                    <label>Responsável</label>
+                    <p>${log.username || log.responsavel || '-'}</p>
+                </div>
+            `;
+
+            if (log.observacao) {
+                metaGrid.innerHTML += `
+                <div class="modal-field" style="grid-column: 1 / -1;">
+                    <label>Legenda / Observação Telegram</label>
+                    <p style="font-style:italic; font-weight:normal; color:var(--text-muted);">💬 "${log.observacao}"</p>
+                </div>
+                `;
+            }
+
+            const tbody = document.getElementById('modalItemsTableBody');
+            tbody.innerHTML = '';
+
+            let itens = log.itens || [];
+            if (!itens.length && log.detalhes) {
+                try {
+                    const parsedDet = JSON.parse(log.detalhes.split(' | ')[0]);
+                    if (parsedDet.itens) itens = parsedDet.itens;
+                } catch (e) {}
+            }
+
+            if (itens && itens.length > 0) {
+                itens.forEach((item, idx) => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td class="font-mono text-muted">${idx + 1}</td>
+                        <td class="font-bold">${item.descricao || item.name || 'Item'}</td>
+                        <td class="text-center font-mono">${item.quantidade || 1}</td>
+                        <td class="text-right font-mono font-bold">R$ ${(parseFloat(item.valor_total_item || item.valor_total || 0)).toFixed(2)}</td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            } else {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="4" class="text-center text-muted" style="padding:20px;">
+                            Nenhum item individual discriminado na nota.
+                        </td>
+                    </tr>
+                `;
+            }
+
+            const linkContainer = document.getElementById('modalLinkContainer');
+            if (log.link_telegram && log.link_telegram.startsWith('http')) {
+                linkContainer.innerHTML = `<a href="${log.link_telegram}" target="_blank" rel="noopener" class="btn-action btn-primary">🖼️ Ver Foto Completa no Telegram</a>`;
+            } else {
+                linkContainer.innerHTML = `<span class="text-muted" style="font-size:12px;">Foto armazenada no chat do Telegram</span>`;
+            }
+
+            document.getElementById('detailModal').classList.add('active');
+        }
+
+        function closeModal() {
+            document.getElementById('detailModal').classList.remove('active');
+        }
+
+        function exportFilteredCSV() {
+            let csv = '\\uFEFFData/Hora;Estabelecimento;Categoria;Tipo Documento;Forma Pagamento;Valor (R$);Aba Mensal;Responsável;Observações\\n';
+
+            filteredLogs.forEach(log => {
+                const row = [
+                    `"${(log.timestamp || '').replace(/"/g, '""')}"`,
+                    `"${(log.estabelecimento || '').replace(/"/g, '""')}"`,
+                    `"${(log.categoria || '').replace(/"/g, '""')}"`,
+                    `"${(log.tipo_documento || '').replace(/"/g, '""')}"`,
+                    `"${(log.pagamento || '').replace(/"/g, '""')}"`,
+                    (parseFloat(log.valor) || 0).toFixed(2).replace('.', ','),
+                    `"${(log.aba_planilha || '').replace(/"/g, '""')}"`,
+                    `"${(log.username || '').replace(/"/g, '""')}"`,
+                    `"${(log.observacao || '').replace(/"/g, '""')}"`
+                ];
+                csv += row.join(';') + '\\n';
+            });
+
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `relatorio_auditoria_${new Date().toISOString().slice(0, 10)}.csv`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeModal();
+        });
+
+        window.onload = function() {
+            updateThemeButtonText();
+            initSelectOptions();
+            onFilterChange();
+        };
+    </script>
 </body>
 </html>
 """
+    html_content = (
+        template
+        .replace("%SHEETS_OK_CLASS%", 'active' if sheets_ok else 'inactive')
+        .replace("%SHEETS_OK_TEXT%", 'Conectado' if sheets_ok else 'Pendente')
+        .replace("%GEMINI_OK_CLASS%", 'active' if gemini_ok else 'inactive')
+        .replace("%GEMINI_OK_TEXT%", 'Ativo' if gemini_ok else 'Sem Chave')
+        .replace("%TELEGRAM_OK_CLASS%", 'active-telegram' if telegram_ok else 'inactive')
+        .replace("%TELEGRAM_OK_TEXT%", 'Pronto' if telegram_ok else 'Sem Token')
+        .replace("%TOTAL_VALOR%", f"{total_valor:.2f}")
+        .replace("%SUCESSOS%", str(sucessos_sheets))
+        .replace("%MEDIA_VALOR%", f"{media_valor:.2f}")
+        .replace("%SHEET_ID_DISPLAY%", sheet_id_display)
+        .replace("%RAW_LOGS_JSON%", raw_logs_json)
+    )
     return HTMLResponse(content=html_content, status_code=200)
+
+

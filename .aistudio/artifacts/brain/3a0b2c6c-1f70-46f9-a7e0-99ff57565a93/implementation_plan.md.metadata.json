@@ -1,0 +1,6 @@
+{
+  "summary": "Plano de implementação para a modernização da interface web do Painel de Auditoria Fiscal. Inclui suporte a Tema Claro/Escuro (Dual Theme), Dashboard Expandido com Gráficos e Distribuição por Categoria, Filtros Avançados por Mês/Estabelecimento/Responsável, Tabela Interativa com Ordenação/Paginação, Exportação CSV e Modal de Detalhes da Nota e Itens.",
+  "updatedAt": "2026-11-05T19:25:14.822654394Z",
+  "requestFeedback": true,
+  "userFacing": true
+}
