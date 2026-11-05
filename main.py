@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import logging
 import time
@@ -12,6 +13,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 from google import genai
 from google.genai import types
 
@@ -23,6 +26,7 @@ logger = logging.getLogger("finance-bot")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
@@ -52,6 +56,66 @@ def get_sheets_client():
     credentials = Credentials.from_service_account_info(cred_dict, scopes=scopes)
     return gspread.authorize(credentials)
 
+def salvar_foto_no_drive(imagem_bytes: bytes, nome_arquivo: str) -> str:
+    """
+    Faz o upload da imagem da nota fiscal para a pasta do Google Drive 
+    e retorna o link público/web de visualização.
+    """
+    if not GOOGLE_CREDENTIALS_JSON:
+        logger.warning("GOOGLE_CREDENTIALS_JSON não configurada. Upload para o Drive ignorado.")
+        return ""
+
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/drive.file"
+        ]
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        service = build('drive', 'v3', credentials=credentials)
+        folder_id = os.getenv("DRIVE_FOLDER_ID")
+        
+        # Metadados do arquivo no Drive
+        file_metadata: Dict[str, Any] = {
+            'name': nome_arquivo
+        }
+        if folder_id:
+            file_metadata['parents'] = [folder_id]
+        
+        # Prepara o stream de bytes para o upload
+        media = MediaIoBaseUpload(
+            io.BytesIO(imagem_bytes),
+            mimetype='image/jpeg',
+            resumable=True
+        )
+        
+        # Executa o upload no Google Drive
+        file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, webViewLink, webContentLink'
+        ).execute()
+        
+        file_id = file.get('id')
+        web_link = file.get('webViewLink') or file.get('webContentLink') or ""
+
+        # Opcional: Garante permissão de leitura para quem tiver o link
+        try:
+            if file_id:
+                service.permissions().create(
+                    fileId=file_id,
+                    body={'type': 'anyone', 'role': 'reader'},
+                    fields='id'
+                ).execute()
+        except Exception as perm_err:
+            logger.info(f"Permissão do arquivo no Drive: {perm_err}")
+
+        logger.info(f"Upload concluído no Google Drive com sucesso: {web_link}")
+        return web_link
+    except Exception as drive_err:
+        logger.error(f"Erro ao salvar foto no Google Drive: {drive_err}", exc_info=True)
+        return ""
+
 def send_telegram_message(chat_id: int, text: str, reply_to_message_id: int = None):
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN não configurado. Mensagem não enviada.")
@@ -60,7 +124,8 @@ def send_telegram_message(chat_id: int, text: str, reply_to_message_id: int = No
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "Markdown"
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": False
     }
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
@@ -178,7 +243,6 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
     # 1. Checagem em memória no histórico recente de logs (evita concorrência e gravações simultâneas)
     for log in processing_logs[:limite_registros]:
         st = log.get("status_sheets", "")
-        # Considera registros já enviados com sucesso ou que estão em fase de gravação
         if st in ("Enviado com Sucesso", "Gravando na Planilha...", "Processando"):
             e_antigo = str(log.get("estabelecimento", "")).strip().lower()
             v_antigo = float(log.get("valor", 0.0))
@@ -214,7 +278,7 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
             ultimas_linhas = todas_linhas[-limite_registros:]
             
             for linha in ultimas_linhas:
-                # Ordem das colunas: [Data, Estabelecimento, Documento, Categoria, Pagamento, Valor]
+                # Ordem das colunas: [Data, Estabelecimento, Documento, Categoria, Pagamento, Valor, (Link Opcional)]
                 if len(linha) >= 6:
                     data_existente = str(linha[0]).strip()
                     estab_existente = str(linha[1]).strip().lower()
@@ -240,7 +304,10 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
             
     return False
 
-def append_to_sheet(data: Dict[str, Any]) -> int:
+def append_to_sheet_com_link(data: Dict[str, Any], link_drive: str = "") -> int:
+    """
+    Salva uma nova linha na Planilha do Google Sheets, incluindo a coluna com o link do Drive.
+    """
     if not SPREADSHEET_ID:
         raise ValueError("SPREADSHEET_ID não configurada nas variáveis de ambiente.")
     
@@ -254,16 +321,20 @@ def append_to_sheet(data: Dict[str, Any]) -> int:
         str(data.get("tipo_documento", "Não Informado")),
         str(data.get("categoria", "Não Informado")),
         str(data.get("pagamento", "Não Informado")),
-        float(data.get("valor", 0.0))
+        float(data.get("valor", 0.0)),
+        str(link_drive or "")  # 7ª coluna: Link do Comprovante no Google Drive
     ]
     worksheet.append_row(row)
     return len(worksheet.get_all_values())
 
+# Compatibilidade com chamadas anteriores
+append_to_sheet = append_to_sheet_com_link
+
 def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, file_id: str, lock_key: str):
     """
     Executado em segundo plano (BackgroundTasks).
-    Isso permite que o endpoint /webhook responda HTTP 200 ao Telegram em milissegundos,
-    eliminando retentativas de timeout enviadas pelo Telegram.
+    Permite responder HTTP 200 ao Telegram em milissegundos e processar
+    análise de IA, upload no Drive e inserção no Sheets de forma assíncrona.
     """
     timestamp_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     log_entry: Dict[str, Any] = {
@@ -278,6 +349,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
         "categoria": "-",
         "pagamento": "-",
         "valor": 0.0,
+        "link_drive": None,
         "erro": None,
         "detalhes": ""
     }
@@ -287,7 +359,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
         # 1. Envia aviso inicial ao usuário
         send_telegram_message(chat_id, "🔍 Processando comprovante fiscal com Gemini...", message_id)
 
-        # 2. Download e Análise com Gemini
+        # 2. Download da imagem do Telegram e Análise com Gemini
         try:
             img_bytes = download_telegram_file(file_id)
             extracted_data = analyze_receipt(img_bytes)
@@ -350,11 +422,27 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             # Marca o status de gravação antes de iniciar o append para bloquear requisições paralelas
             log_entry["status_sheets"] = "Gravando na Planilha..."
 
-            # 5. Envio para a Planilha do Google Sheets
+            # 5. Salva a foto no Google Drive e obtém o link de visualização
+            data_clean = str(extracted_data.get("data", "sem_data")).replace("/", "-")
+            estab_raw = str(extracted_data.get("estabelecimento", "comprovante"))
+            estab_clean = "".join([c for c in estab_raw if c.isalnum() or c in (" ", "_", "-")]).strip()
+            nome_arquivo_drive = f"comprovante_{data_clean}_{estab_clean}.jpg"
+            
+            link_comprovante = ""
             try:
-                total_linhas = append_to_sheet(extracted_data)
+                link_comprovante = salvar_foto_no_drive(img_bytes, nome_arquivo_drive)
+                log_entry["link_drive"] = link_comprovante
+            except Exception as e_drive:
+                logger.warning(f"Aviso ao salvar no Google Drive: {e_drive}")
+
+            # 6. Envio para a Planilha do Google Sheets (com o link da foto)
+            try:
+                total_linhas = append_to_sheet_com_link(extracted_data, link_comprovante)
                 log_entry["status_sheets"] = "Enviado com Sucesso"
-                log_entry["detalhes"] += f" | Linha registrada: {total_linhas}"
+                det_extra = f" | Linha: {total_linhas}"
+                if link_comprovante:
+                    det_extra += " | Drive: OK"
+                log_entry["detalhes"] += det_extra
             except Exception as e_sheets:
                 log_entry["status_sheets"] = "Falha no Envio"
                 log_entry["erro"] = f"Erro Google Sheets: {str(e_sheets)}"
@@ -362,7 +450,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
                 send_telegram_message(chat_id, f"⚠️ Dados extraídos, mas falhou ao gravar na Planilha Google: {str(e_sheets)}", message_id)
                 return
 
-        # 6. Notificação de Sucesso no Telegram
+        # 7. Notificação de Sucesso no Telegram (com link clicável do Google Drive)
         success_msg = (
             "✅ *Lançamento Registrado com Sucesso!*\n\n"
             f"• *Data:* {extracted_data.get('data')}\n"
@@ -370,9 +458,12 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             f"• *Documento:* {extracted_data.get('tipo_documento')}\n"
             f"• *Categoria:* {extracted_data.get('categoria')}\n"
             f"• *Pagamento:* {extracted_data.get('pagamento')}\n"
-            f"• *Valor:* R$ {float(extracted_data.get('valor', 0)):.2f}\n\n"
-            "📊 *Gravado na Planilha do Google Sheets!*"
+            f"• *Valor:* R$ {float(extracted_data.get('valor', 0)):.2f}"
         )
+        if link_comprovante:
+            success_msg += f"\n• 📁 [Ver Comprovante no Google Drive]({link_comprovante})"
+
+        success_msg += "\n\n📊 *Gravado na Planilha do Google Sheets!*"
         send_telegram_message(chat_id, success_msg, message_id)
 
     except Exception as e_all:
@@ -442,6 +533,7 @@ def get_logs_json():
         "status": "ok",
         "total_logs": len(processing_logs),
         "spreadsheet_id_configured": bool(SPREADSHEET_ID),
+        "drive_folder_id_configured": bool(DRIVE_FOLDER_ID),
         "credentials_configured": bool(GOOGLE_CREDENTIALS_JSON),
         "gemini_configured": bool(GEMINI_API_KEY),
         "logs": processing_logs
@@ -453,9 +545,11 @@ def dashboard_logs_page():
     sucessos_sheets = sum(1 for log in processing_logs if log.get("status_sheets") == "Enviado com Sucesso")
     falhas_sheets = sum(1 for log in processing_logs if "Falha" in log.get("status_sheets", "") or "Erro" in log.get("status_sheets", ""))
     total_valor = sum(log.get("valor", 0.0) for log in processing_logs if log.get("status_sheets") == "Enviado com Sucesso")
+    comprovantes_drive = sum(1 for log in processing_logs if log.get("link_drive"))
 
     # Status de configurações
     sheets_ok = bool(SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON)
+    drive_ok = bool(DRIVE_FOLDER_ID and GOOGLE_CREDENTIALS_JSON)
     gemini_ok = bool(GEMINI_API_KEY)
     telegram_ok = bool(TELEGRAM_BOT_TOKEN)
 
@@ -464,7 +558,7 @@ def dashboard_logs_page():
     if not processing_logs:
         rows_html = """
         <tr>
-            <td colspan="7" class="empty-state">
+            <td colspan="8" class="empty-state">
                 <div style="padding: 40px 20px; text-align: center; color: #64748b;">
                     <div style="font-size: 32px; margin-bottom: 8px;">📋</div>
                     <div style="font-weight: 600; font-size: 15px; color: #334155;">Nenhum comprovante processado até o momento</div>
@@ -491,6 +585,13 @@ def dashboard_logs_page():
 
             erro_html = f'<div class="error-msg">{log.get("erro")}</div>' if log.get("erro") else ""
 
+            # Link do Google Drive
+            link_drive = log.get("link_drive")
+            if link_drive:
+                drive_btn_html = f'<a href="{link_drive}" target="_blank" rel="noopener noreferrer" class="drive-btn">📁 Ver no Drive</a>'
+            else:
+                drive_btn_html = '<span class="text-muted" style="font-size: 11px;">Sem Link</span>'
+
             rows_html += f"""
             <tr>
                 <td class="font-mono text-muted">{log.get("timestamp")}</td>
@@ -498,12 +599,13 @@ def dashboard_logs_page():
                 <td><span class="pill-category">{log.get("categoria")}</span></td>
                 <td>{log.get("tipo_documento")} / {log.get("pagamento")}</td>
                 <td class="font-mono font-bold text-right">R$ {log.get("valor", 0.0):.2f}</td>
+                <td class="text-center">{drive_btn_html}</td>
                 <td class="text-center">{status_badge}{erro_html}</td>
                 <td class="text-muted font-mono">{log.get("username")}</td>
             </tr>
             """
 
-    # Mascarar ID da planilha para exibição segura
+    # Mascarar ID da planilha e pasta do drive para exibição segura
     sheet_id_display = "Não configurada"
     if SPREADSHEET_ID:
         if len(SPREADSHEET_ID) > 12:
@@ -511,12 +613,19 @@ def dashboard_logs_page():
         else:
             sheet_id_display = SPREADSHEET_ID
 
+    folder_id_display = "Não configurada"
+    if DRIVE_FOLDER_ID:
+        if len(DRIVE_FOLDER_ID) > 12:
+            folder_id_display = f"{DRIVE_FOLDER_ID[:6]}...{DRIVE_FOLDER_ID[-6:]}"
+        else:
+            folder_id_display = DRIVE_FOLDER_ID
+
     html_content = f"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Log de Auditoria & Google Sheets - Bot Financeiro</title>
+    <title>Log de Auditoria, Drive & Google Sheets - Bot Financeiro</title>
     <meta http-equiv="refresh" content="15">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -535,6 +644,8 @@ def dashboard_logs_page():
             --danger-light: #fef2f2;
             --info: #0284c7;
             --info-light: #f0f9ff;
+            --drive-color: #4285F4;
+            --drive-light: #e8f0fe;
         }}
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
@@ -545,7 +656,7 @@ def dashboard_logs_page():
             padding: 24px;
         }}
         .container {{
-            max-width: 1200px;
+            max-width: 1250px;
             margin: 0 auto;
         }}
         header {{
@@ -576,7 +687,7 @@ def dashboard_logs_page():
         }}
         .status-indicators {{
             display: flex;
-            gap: 12px;
+            gap: 10px;
             flex-wrap: wrap;
         }}
         .indicator {{
@@ -593,6 +704,10 @@ def dashboard_logs_page():
             background: var(--primary-light);
             color: var(--primary-dark);
         }}
+        .indicator.active-drive {{
+            background: var(--drive-light);
+            color: var(--drive-color);
+        }}
         .indicator.inactive {{
             background: var(--danger-light);
             color: var(--danger);
@@ -605,7 +720,7 @@ def dashboard_logs_page():
         }}
         .kpi-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
             gap: 16px;
             margin-bottom: 24px;
         }}
@@ -617,14 +732,14 @@ def dashboard_logs_page():
             box-shadow: 0 1px 2px rgba(0,0,0,0.02);
         }}
         .kpi-card .label {{
-            font-size: 12px;
-            font-weight: 600;
+            font-size: 11px;
+            font-weight: 700;
             color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }}
         .kpi-card .value {{
-            font-size: 26px;
+            font-size: 24px;
             font-weight: 800;
             font-family: 'JetBrains Mono', monospace;
             margin-top: 4px;
@@ -676,7 +791,7 @@ def dashboard_logs_page():
         }}
         th {{
             background: #f8fafc;
-            padding: 12px 18px;
+            padding: 12px 16px;
             font-weight: 700;
             font-size: 11px;
             text-transform: uppercase;
@@ -685,7 +800,7 @@ def dashboard_logs_page():
             border-bottom: 1px solid var(--border-color);
         }}
         td {{
-            padding: 14px 18px;
+            padding: 14px 16px;
             border-bottom: 1px solid var(--border-color);
             color: #1e293b;
         }}
@@ -724,6 +839,22 @@ def dashboard_logs_page():
             color: var(--info);
             border: 1px solid #bae6fd;
         }}
+        .drive-btn {{
+            display: inline-block;
+            background: var(--drive-light);
+            color: #1a73e8;
+            font-weight: 700;
+            font-size: 11px;
+            padding: 4px 10px;
+            border-radius: 6px;
+            text-decoration: none;
+            border: 1px solid #c2d7fa;
+            transition: all 0.15s;
+        }}
+        .drive-btn:hover {{
+            background: #d2e3fc;
+            text-decoration: underline;
+        }}
         .pill-category {{
             background: #f1f5f9;
             color: #334155;
@@ -755,12 +886,15 @@ def dashboard_logs_page():
     <div class="container">
         <header>
             <div class="title-group">
-                <h1>📊 Monitor de Auditoria & Google Sheets</h1>
-                <p>Verificação em tempo real dos comprovantes recebidos e gravados na planilha</p>
+                <h1>📊 Monitor de Auditoria & Google Sheets + Drive</h1>
+                <p>Verificação em tempo real dos comprovantes recebidos, salvos no Drive e gravados na planilha</p>
             </div>
             <div class="status-indicators">
                 <div class="indicator {'active' if sheets_ok else 'inactive'}">
-                    <span class="dot"></span> Google Sheets {'Conectado' if sheets_ok else 'Pendente'}
+                    <span class="dot"></span> Sheets {'Conectado' if sheets_ok else 'Pendente'}
+                </div>
+                <div class="indicator {'active-drive' if drive_ok else 'inactive'}">
+                    <span class="dot"></span> Drive {'Pasta Configurada' if drive_ok else 'Pasta Pendente'}
                 </div>
                 <div class="indicator {'active' if gemini_ok else 'inactive'}">
                     <span class="dot"></span> Gemini AI {'Ativo' if gemini_ok else 'Sem Chave'}
@@ -775,12 +909,17 @@ def dashboard_logs_page():
             <div class="kpi-card">
                 <div class="label">Gravados na Planilha</div>
                 <div class="value" style="color: var(--primary-dark);">{sucessos_sheets}</div>
-                <div class="subtext">Sincronizados com o Google Sheets</div>
+                <div class="subtext">Sincronizados com a planilha</div>
+            </div>
+            <div class="kpi-card">
+                <div class="label">Comprovantes no Drive</div>
+                <div class="value" style="color: #1a73e8;">{comprovantes_drive}</div>
+                <div class="subtext">Fotos salvas no Google Drive</div>
             </div>
             <div class="kpi-card">
                 <div class="label">Total Processados</div>
                 <div class="value">{total_recebidos}</div>
-                <div class="subtext">Comprovantes via Telegram</div>
+                <div class="subtext">Mensagens via Telegram</div>
             </div>
             <div class="kpi-card">
                 <div class="label">Valor Total Registrado</div>
@@ -788,15 +927,15 @@ def dashboard_logs_page():
                 <div class="subtext">Soma das notas válidas</div>
             </div>
             <div class="kpi-card">
-                <div class="label">ID da Planilha Ativa</div>
-                <div class="value font-mono" style="font-size: 15px; margin-top: 8px;">{sheet_id_display}</div>
-                <div class="subtext">Aba 0 (Principal)</div>
+                <div class="label">Pasta do Google Drive</div>
+                <div class="value font-mono" style="font-size: 14px; margin-top: 8px;">{folder_id_display}</div>
+                <div class="subtext">DRIVE_FOLDER_ID</div>
             </div>
         </div>
 
         <div class="table-card">
             <div class="table-header">
-                <h2>Histórico de Envios para a Planilha do Google</h2>
+                <h2>Histórico de Envios para a Planilha do Google & Drive</h2>
                 <button class="refresh-btn" onclick="window.location.reload()">↻ Atualizar (Auto 15s)</button>
             </div>
             <div style="overflow-x: auto;">
@@ -808,6 +947,7 @@ def dashboard_logs_page():
                             <th>Categoria</th>
                             <th>Doc / Pagamento</th>
                             <th class="text-right">Valor</th>
+                            <th class="text-center">Comprovante</th>
                             <th class="text-center">Status Google Sheets</th>
                             <th>Usuário Telegram</th>
                         </tr>
@@ -820,7 +960,7 @@ def dashboard_logs_page():
         </div>
 
         <footer>
-            <div>Auditor Fiscal AI · Integração Telegram & Google Sheets</div>
+            <div>Auditor Fiscal AI · Telegram + Google Sheets + Google Drive</div>
             <div>Atualização automática a cada 15 segundos</div>
         </footer>
     </div>
