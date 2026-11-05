@@ -566,6 +566,11 @@ app.post('/webhook', async (req: Request, res: Response) => {
         });
       }
 
+      const userFrom = message.from || {};
+      const nomeUser = userFrom.first_name || 'Usuário';
+      const sobrenomeUser = userFrom.last_name || '';
+      const responsavelCompleto = `${nomeUser} ${sobrenomeUser}`.trim();
+
       const legendaFoto = (message.caption || req.body.caption || req.body.observacao || '').trim();
 
       // Create new fiscal entry matching user's append_to_sheet pipeline
@@ -580,7 +585,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
         cnpj: parsed.cnpj,
         itens: parsed.itens,
         status_auditoria: 'auditado',
-        audit_notes: legendaFoto ? `Obs: ${legendaFoto}` : `Lançamento automático via Telegram Webhook (Chat ID: ${chatId})`,
+        audit_notes: legendaFoto ? `Obs: ${legendaFoto}` : `Lançamento por ${responsavelCompleto} via Telegram Webhook`,
         observacao: legendaFoto || undefined,
         origem: 'telegram_webhook',
         criado_em: new Date().toISOString(),
@@ -594,16 +599,16 @@ app.post('/webhook', async (req: Request, res: Response) => {
         timestamp: new Date().toISOString(),
         chat_id: chatId,
         origem: 'Telegram Webhook',
-        payload_summary: `Foto processada com sucesso: ${parsed.estabelecimento} - R$ ${parsed.valor.toFixed(2)}${legendaFoto ? ` (Obs: ${legendaFoto})` : ''}`,
+        payload_summary: `Foto por ${responsavelCompleto}: ${parsed.estabelecimento} - R$ ${parsed.valor.toFixed(2)}${legendaFoto ? ` (Obs: ${legendaFoto})` : ''}`,
         status: 'sucesso',
         extracted_data: parsed,
       });
 
       let confirmationText = 
         `✅ *Lançamento Registrado com Sucesso!*\n\n` +
+        `• *Responsável:* ${responsavelCompleto}\n` +
         `• *Data:* ${parsed.data}\n` +
         `• *Estabelecimento:* ${parsed.estabelecimento}\n` +
-        `• *Documento:* ${parsed.tipo_documento}\n` +
         `• *Categoria:* ${parsed.categoria}\n` +
         `• *Pagamento:* ${parsed.pagamento}\n` +
         `• *Valor:* R$ ${Number(parsed.valor).toFixed(2)}`;

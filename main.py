@@ -260,10 +260,10 @@ def obter_nome_aba(data_str: str) -> str:
         nome_mes = MESES_PT[agora.month]
         return f"{nome_mes}_{agora.year}"
 
-def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", observacao: str = "") -> tuple[int, str]:
+def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", observacao: str = "", responsavel: str = "Não Informado") -> tuple[int, str]:
     """
     Grava o lançamento na aba mensal correspondente (ex: Novembro_2026),
-    incluindo a coluna de Observação com a legenda enviada no Telegram.
+    incluindo a coluna Responsável e a coluna de Observação com a legenda enviada no Telegram.
     Se a aba não existir, cria automaticamente com cabeçalho formatado.
     """
     if not SPREADSHEET_ID:
@@ -281,7 +281,7 @@ def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", o
     except Exception:
         try:
             worksheet = sh.add_worksheet(title=nome_aba, rows=100, cols=10)
-            cabecalho = ["Data", "Estabelecimento", "Tipo Documento", "Categoria", "Forma Pagamento", "Valor (R$)", "Comprovante", "Observação"]
+            cabecalho = ["Data", "Estabelecimento", "Tipo Documento", "Categoria", "Forma Pagamento", "Valor (R$)", "Responsável", "Comprovante", "Observação"]
             worksheet.append_row(cabecalho, value_input_option='USER_ENTERED')
             logger.info(f"Nova aba criada com sucesso: {nome_aba}")
         except Exception as e_add:
@@ -317,8 +317,9 @@ def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", o
         str(data.get("categoria", "Não Informado")),
         str(data.get("pagamento", "Não Informado")),
         float(data.get("valor", 0.0)),
-        formula_link,
-        str(observacao or "")  # 8ª coluna: Observação (legenda da foto no Telegram)
+        str(responsavel or "Não Informado"),  # 7ª coluna: Responsável (quem enviou a foto)
+        formula_link,                         # 8ª coluna: Comprovante
+        str(observacao or "")                 # 9ª coluna: Observação (legenda da foto no Telegram)
     ]
 
     try:
@@ -326,11 +327,11 @@ def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", o
     except Exception as e_user_entered:
         logger.warning(f"Tentativa com USER_ENTERED falhou ({e_user_entered}). Tentando formato compatível...")
         if url_direta_imagem.startswith("http"):
-            row[6] = f'=HYPERLINK("{url_direta_imagem}", "Ver Imagem")'
+            row[7] = f'=HYPERLINK("{url_direta_imagem}", "Ver Imagem")'
             try:
                 worksheet.append_row(row, value_input_option='USER_ENTERED')
             except Exception:
-                row[6] = url_direta_imagem
+                row[7] = url_direta_imagem
                 worksheet.append_row(row)
         else:
             worksheet.append_row(row)
@@ -436,7 +437,7 @@ def gerar_relatorio_mensal(nome_aba: str = None) -> str:
     relatorio += f"\n🔗 [Abrir Planilha no Google Sheets](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID})"
     return relatorio
 
-def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, file_id: str, lock_key: str, observacao: str = ""):
+def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, file_id: str, lock_key: str, observacao: str = "", responsavel: str = "Não Informado"):
     """
     Executado em segundo plano (BackgroundTasks).
     Permite responder HTTP 200 ao Telegram em milissegundos e processar
@@ -447,7 +448,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
         "id": f"log-{int(datetime.now().timestamp() * 1000)}",
         "timestamp": timestamp_str,
         "chat_id": str(chat_id),
-        "username": str(chat_user),
+        "username": str(responsavel or chat_user),
         "status_gemini": "Processando",
         "status_sheets": "Pendente",
         "estabelecimento": "-",
@@ -456,6 +457,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
         "pagamento": "-",
         "valor": 0.0,
         "observacao": observacao or None,
+        "responsavel": responsavel,
         "origem_foto": f"Telegram ID: {file_id[:10]}...",
         "erro": None,
         "detalhes": ""
@@ -528,14 +530,14 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             # Marca o status de gravação antes de iniciar o append para bloquear requisições paralelas
             log_entry["status_sheets"] = "Gravando na Planilha..."
 
-            # 5. Salva na planilha na aba mensal correspondente com o link direto da imagem e observação
+            # 5. Salva na planilha na aba mensal correspondente com o link direto da imagem, observação e responsável
             try:
                 log_entry["link_telegram"] = url_direta_imagem
                 
-                total_linhas, nome_aba = append_to_sheet_aba_mensal(extracted_data, file_id, url_direta_imagem, observacao=observacao)
+                total_linhas, nome_aba = append_to_sheet_aba_mensal(extracted_data, file_id, url_direta_imagem, observacao=observacao, responsavel=responsavel)
                 log_entry["status_sheets"] = "Enviado com Sucesso"
                 log_entry["aba_planilha"] = nome_aba
-                det_extra = f" | Aba: {nome_aba} | Linha: {total_linhas} | Imagem Direta: OK"
+                det_extra = f" | Aba: {nome_aba} | Linha: {total_linhas} | Responsável: {responsavel} | Imagem Direta: OK"
                 if observacao:
                     det_extra += f" | Obs: {observacao}"
                 log_entry["detalhes"] += det_extra
@@ -549,6 +551,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
         # 6. Mensagem de sucesso limpa no grupo do Telegram
         success_msg = (
             "✅ *Lançamento Registrado com Sucesso!*\n\n"
+            f"• *Responsável:* {responsavel}\n"
             f"• *Data:* {extracted_data.get('data')}\n"
             f"• *Estabelecimento:* {extracted_data.get('estabelecimento')}\n"
             f"• *Categoria:* {extracted_data.get('categoria')}\n"
@@ -632,6 +635,13 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             largest_photo = message["photo"][-1]
             file_id = largest_photo["file_id"]
             legenda_foto = message.get("caption", "").strip()
+
+            # Captura o nome de quem enviou a mensagem no Telegram
+            user_info = message.get("from", {})
+            nome_usuario = user_info.get("first_name", "Usuário")
+            sobrenome = user_info.get("last_name", "")
+            responsavel_completo = f"{nome_usuario} {sobrenome}".strip() or str(chat_user)
+
             lock_key = f"{chat_id}:{message_id}:{file_id}"
 
             if lock_key in in_progress_locks:
@@ -648,7 +658,8 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 chat_user=str(chat_user),
                 file_id=file_id,
                 lock_key=lock_key,
-                observacao=legenda_foto
+                observacao=legenda_foto,
+                responsavel=responsavel_completo
             )
 
         return Response(status_code=status.HTTP_200_OK)
