@@ -195,12 +195,16 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
                 logger.info(f"Duplicidade detectada no cache local em memória: {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
                 return True
 
-    # 2. Checagem direta na planilha do Google Sheets
+    # 2. Checagem direta na planilha do Google Sheets (na aba mensal correspondente)
     if SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON:
         try:
             gc = get_sheets_client()
             sh = gc.open_by_key(SPREADSHEET_ID)
-            worksheet = sh.get_worksheet(0)
+            nome_aba = obter_nome_aba(data_nova)
+            try:
+                worksheet = sh.worksheet(nome_aba)
+            except Exception:
+                worksheet = sh.get_worksheet(0)
             
             todas_linhas = worksheet.get_all_values()
             
@@ -210,7 +214,7 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
             ultimas_linhas = todas_linhas[-limite_registros:]
             
             for linha in ultimas_linhas:
-                # Ordem das colunas: [Data, Estabelecimento, Documento, Categoria, Pagamento, Valor, Origem/Ref]
+                # Ordem das colunas: [Data, Estabelecimento, Documento, Categoria, Pagamento, Valor, Comprovante]
                 if len(linha) >= 6:
                     data_existente = str(linha[0]).strip()
                     estab_existente = str(linha[1]).strip().lower()
@@ -228,43 +232,78 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
                     if (data_nova == data_existente and 
                         estab_novo == estab_existente and 
                         abs(valor_novo - valor_existente) < 0.01):
-                        logger.info(f"Duplicidade detectada no Google Sheets: {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
+                        logger.info(f"Duplicidade detectada no Google Sheets ({nome_aba}): {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
                         return True
         except Exception as e_dup:
             logger.warning(f"Aviso ao consultar duplicidade no Google Sheets: {e_dup}")
             
     return False
 
-def append_to_sheet_link_direto(data: dict, file_id: str, url_direta: str = "") -> int:
+# Mapeamento dos meses para nomes em português
+MESES_PT = {
+    1: "Janeiro", 2: "Fevereiro", 3: "Marco", 4: "Abril",
+    5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
+    9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"
+}
+
+def obter_nome_aba(data_str: str) -> str:
     """
-    Grava uma nova linha na Planilha do Google Sheets, inserindo a fórmula =HYPERLINK
-    com o link direto para visualização do arquivo de imagem (.jpg) nos servidores do Telegram.
+    Converte uma string de data (DD/MM/AAAA) no nome da aba (ex: Novembro_2026).
+    Se a data for inválida ou não informada, utiliza o mês/ano atual.
+    """
+    try:
+        data_obj = datetime.strptime(str(data_str).strip(), "%d/%m/%Y")
+        nome_mes = MESES_PT[data_obj.month]
+        return f"{nome_mes}_{data_obj.year}"
+    except Exception:
+        agora = datetime.now()
+        nome_mes = MESES_PT[agora.month]
+        return f"{nome_mes}_{agora.year}"
+
+def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "") -> tuple[int, str]:
+    """
+    Grava o lançamento na aba mensal correspondente (ex: Novembro_2026).
+    Se a aba não existir, cria automaticamente com cabeçalho formatado.
     """
     if not SPREADSHEET_ID:
         raise ValueError("SPREADSHEET_ID não configurada nas variáveis de ambiente.")
     
     gc = get_sheets_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
-    worksheet = sh.get_worksheet(0)
     
+    # 1. Determina o nome da aba com base na data do gasto
+    nome_aba = obter_nome_aba(data.get("data", ""))
+    
+    # 2. Tenta selecionar a aba ou cria uma nova se não existir
+    try:
+        worksheet = sh.worksheet(nome_aba)
+    except Exception:
+        try:
+            worksheet = sh.add_worksheet(title=nome_aba, rows=100, cols=10)
+            cabecalho = ["Data", "Estabelecimento", "Tipo Documento", "Categoria", "Forma Pagamento", "Valor (R$)", "Comprovante"]
+            worksheet.append_row(cabecalho, value_input_option='USER_ENTERED')
+            logger.info(f"Nova aba criada com sucesso: {nome_aba}")
+        except Exception as e_add:
+            logger.warning(f"Aviso ao criar aba {nome_aba}: {e_add}. Usando aba ativa...")
+            worksheet = sh.get_worksheet(0)
+    
+    # 3. Monta o link direto da imagem no Telegram
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
-    
-    # 1. Obtém o file_path real do Telegram usando o file_id caso não tenha sido passado
     url_direta_imagem = url_direta
+    
     if not url_direta_imagem and file_id and bot_token:
         try:
-            res_path = requests.get(f"https://api.telegram.org/bot{bot_token}/getFile", params={"file_id": file_id}, timeout=10).json()
+            res_path = requests.get(f"{TELEGRAM_API_BASE}/getFile", params={"file_id": file_id}, timeout=10).json()
             if res_path.get("ok"):
                 file_path = res_path["result"]["file_path"]
-                # 2. Monta a URL direta para o arquivo de imagem nos servidores do Telegram
                 url_direta_imagem = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
         except Exception as e:
-            logger.warning(f"Erro ao obter file_path para link direto: {e}")
+            logger.warning(f"Erro ao obter URL da imagem: {e}")
             
     if not url_direta_imagem:
         url_direta_imagem = "Não disponível"
 
-    # 3. Cria a fórmula clicável no Google Sheets para abrir a foto diretamente
+    # 4. Cria a fórmula clicável no Google Sheets
     if url_direta_imagem.startswith("http"):
         formula_link = f'=HYPERLINK("{url_direta_imagem}"; "Ver Imagem")'
     else:
@@ -277,13 +316,13 @@ def append_to_sheet_link_direto(data: dict, file_id: str, url_direta: str = "") 
         str(data.get("categoria", "Não Informado")),
         str(data.get("pagamento", "Não Informado")),
         float(data.get("valor", 0.0)),
-        formula_link  # <--- Insere o link direto da imagem
+        formula_link
     ]
 
     try:
         worksheet.append_row(row, value_input_option='USER_ENTERED')
     except Exception as e_user_entered:
-        logger.warning(f"Tentativa com USER_ENTERED falhou ({e_user_entered}). Tentando formato com vírgula...")
+        logger.warning(f"Tentativa com USER_ENTERED falhou ({e_user_entered}). Tentando formato compatível...")
         if url_direta_imagem.startswith("http"):
             row[6] = f'=HYPERLINK("{url_direta_imagem}", "Ver Imagem")'
             try:
@@ -294,12 +333,14 @@ def append_to_sheet_link_direto(data: dict, file_id: str, url_direta: str = "") 
         else:
             worksheet.append_row(row)
 
-    return len(worksheet.get_all_values())
+    total_linhas = len(worksheet.get_all_values())
+    return total_linhas, nome_aba
 
 # Aliases para compatibilidade total
-append_to_sheet = append_to_sheet_link_direto
-append_to_sheet_telegram = append_to_sheet_link_direto
-append_to_sheet_com_link_telegram = append_to_sheet_link_direto
+append_to_sheet = append_to_sheet_aba_mensal
+append_to_sheet_link_direto = append_to_sheet_aba_mensal
+append_to_sheet_telegram = append_to_sheet_aba_mensal
+append_to_sheet_com_link_telegram = append_to_sheet_aba_mensal
 
 def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, file_id: str, lock_key: str):
     """
@@ -392,13 +433,14 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             # Marca o status de gravação antes de iniciar o append para bloquear requisições paralelas
             log_entry["status_sheets"] = "Gravando na Planilha..."
 
-            # 5. Salva na planilha com os dados extraídos e a fórmula de link direto da imagem
+            # 5. Salva na planilha na aba mensal correspondente com o link direto da imagem
             try:
                 log_entry["link_telegram"] = url_direta_imagem
                 
-                total_linhas = append_to_sheet_link_direto(extracted_data, file_id, url_direta_imagem)
+                total_linhas, nome_aba = append_to_sheet_aba_mensal(extracted_data, file_id, url_direta_imagem)
                 log_entry["status_sheets"] = "Enviado com Sucesso"
-                log_entry["detalhes"] += f" | Linha registrada: {total_linhas} | Imagem Direta: OK"
+                log_entry["aba_planilha"] = nome_aba
+                log_entry["detalhes"] += f" | Aba: {nome_aba} | Linha: {total_linhas} | Imagem Direta: OK"
             except Exception as e_sheets:
                 log_entry["status_sheets"] = "Falha no Envio"
                 log_entry["erro"] = f"Erro Google Sheets: {str(e_sheets)}"
@@ -413,7 +455,8 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             f"• *Estabelecimento:* {extracted_data.get('estabelecimento')}\n"
             f"• *Categoria:* {extracted_data.get('categoria')}\n"
             f"• *Pagamento:* {extracted_data.get('pagamento')}\n"
-            f"• *Valor:* R$ {float(extracted_data.get('valor', 0)):.2f}\n\n"
+            f"• *Valor:* R$ {float(extracted_data.get('valor', 0)):.2f}\n"
+            f"• *Aba Mensal:* `{nome_aba}`\n\n"
             "📊 *Gravado na Planilha do Google Sheets!*"
         )
         send_telegram_message(chat_id, success_msg, message_id)
@@ -533,11 +576,14 @@ def dashboard_logs_page():
 
             # Referência ou Link direto da foto no Telegram
             link_tg = log.get("link_telegram")
-            if link_tg:
-                origem_html = f'<a href="{link_tg}" target="_blank" rel="noopener noreferrer" class="badge-telegram" style="color:#0284c7; text-decoration:none; font-weight:700;">🔗 Ver Comprovante</a>'
+            if link_tg and link_tg.startswith("http"):
+                origem_html = f'<a href="{link_tg}" target="_blank" rel="noopener noreferrer" class="badge-telegram" style="color:#0284c7; text-decoration:none; font-weight:700;">🖼️ Ver Imagem</a>'
             else:
                 ref_origem = log.get("origem_foto", "Telegram")
                 origem_html = f'<span class="badge-telegram">💬 {ref_origem}</span>'
+
+            aba_nome = log.get("aba_planilha") or "Mensal"
+            aba_badge = f'<span class="pill-category" style="background:#e0f2fe; color:#0369a1; border:1px solid #bae6fd; font-weight:700;">{aba_nome}</span>'
 
             rows_html += f"""
             <tr>
@@ -545,6 +591,7 @@ def dashboard_logs_page():
                 <td class="font-bold">{log.get("estabelecimento")}</td>
                 <td><span class="pill-category">{log.get("categoria")}</span></td>
                 <td>{log.get("tipo_documento")} / {log.get("pagamento")}</td>
+                <td class="text-center">{aba_badge}</td>
                 <td class="font-mono font-bold text-right">R$ {log.get("valor", 0.0):.2f}</td>
                 <td class="text-center">{origem_html}</td>
                 <td class="text-center">{status_badge}{erro_html}</td>
@@ -855,7 +902,7 @@ def dashboard_logs_page():
             <div class="kpi-card">
                 <div class="label">Planilha Conectada</div>
                 <div class="value font-mono" style="font-size: 14px; margin-top: 8px;">{sheet_id_display}</div>
-                <div class="subtext">Aba 0 (Principal)</div>
+                <div class="subtext">Abas Mensais Automáticas</div>
             </div>
         </div>
 
@@ -872,6 +919,7 @@ def dashboard_logs_page():
                             <th>Estabelecimento</th>
                             <th>Categoria</th>
                             <th>Doc / Pagamento</th>
+                            <th class="text-center">Aba Mensal</th>
                             <th class="text-right">Valor</th>
                             <th class="text-center">Comprovante</th>
                             <th class="text-center">Status Google Sheets</th>
