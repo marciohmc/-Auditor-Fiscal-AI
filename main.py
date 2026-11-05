@@ -1512,6 +1512,9 @@ def dashboard_logs_page(request: Request):
                 <button class="btn-action" onclick="toggleTheme()" id="themeToggleBtn">
                     🌙 Tema Escuro
                 </button>
+                <a href="/logs" class="btn-action">
+                    📜 Logs do Sistema
+                </a>
                 <button class="btn-action" onclick="window.location.reload()">
                     ↻ Atualizar
                 </button>
@@ -2101,5 +2104,734 @@ def dashboard_logs_page(request: Request):
         .replace("%RAW_LOGS_JSON%", raw_logs_json)
     )
     return HTMLResponse(content=html_content, status_code=200)
+
+@app.get("/logs", response_class=HTMLResponse)
+def system_logs_page(request: Request):
+    if not is_authenticated(request):
+        return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+
+    total_logs = len(processing_logs)
+    sucessos_sheets = sum(1 for log in processing_logs if log.get("status_sheets") == "Enviado com Sucesso")
+    falhas_count = sum(1 for log in processing_logs if log.get("erro") or "Falha" in str(log.get("status_sheets")) or "Falha" in str(log.get("status_gemini")))
+
+    sheets_ok = bool(SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON)
+    gemini_ok = bool(GEMINI_KEYS)
+    telegram_ok = bool(TELEGRAM_BOT_TOKEN)
+
+    active_key_idx = (current_key_index % len(GEMINI_KEYS)) + 1 if GEMINI_KEYS else 0
+    raw_logs_json = json.dumps(processing_logs, ensure_ascii=False)
+
+    template = """<!DOCTYPE html>
+<html lang="pt-BR" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Central de Logs do Sistema — Auditor Fiscal AI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script>
+        (function() {
+            const savedTheme = localStorage.getItem('theme');
+            if (savedTheme === 'light') {
+                document.documentElement.classList.remove('dark');
+            } else {
+                document.documentElement.classList.add('dark');
+            }
+        })();
+    </script>
+    <style>
+        :root {
+            --bg-color: #f8fafc;
+            --surface-color: #ffffff;
+            --surface-hover: #f1f5f9;
+            --border-color: #e2e8f0;
+            --text-main: #0f172a;
+            --text-muted: #64748b;
+            --primary: #10b981;
+            --primary-dark: #059669;
+            --primary-light: #ecfdf5;
+            --danger: #ef4444;
+            --danger-light: #fef2f2;
+            --info: #0284c7;
+            --info-light: #f0f9ff;
+            --telegram-color: #0284c7;
+            --telegram-light: #e0f2fe;
+            --card-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            --input-bg: #ffffff;
+            --modal-overlay: rgba(15, 23, 42, 0.6);
+        }
+
+        .dark {
+            --bg-color: #0b0f19;
+            --surface-color: #111827;
+            --surface-hover: #1f2937;
+            --border-color: #1f2937;
+            --text-main: #f9fafb;
+            --text-muted: #9ca3af;
+            --primary: #10b981;
+            --primary-dark: #34d399;
+            --primary-light: rgba(16, 185, 129, 0.15);
+            --danger: #f87171;
+            --danger-light: rgba(239, 68, 68, 0.15);
+            --info: #38bdf8;
+            --info-light: rgba(2, 132, 199, 0.15);
+            --telegram-color: #38bdf8;
+            --telegram-light: rgba(56, 189, 248, 0.15);
+            --card-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            --input-bg: #1f2937;
+            --modal-overlay: rgba(0, 0, 0, 0.8);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding: 24px 16px;
+            transition: background-color 0.2s, color 0.2s;
+        }
+        .container {
+            max-width: 1300px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 20px 24px;
+            margin-bottom: 20px;
+            box-shadow: var(--card-shadow);
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+        }
+        .brand-zone {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .brand-icon {
+            width: 44px;
+            height: 44px;
+            background: var(--info-light);
+            color: var(--info);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+        }
+        .title-group h1 {
+            font-size: 20px;
+            font-weight: 800;
+            color: var(--text-main);
+            letter-spacing: -0.3px;
+        }
+        .title-group p {
+            font-size: 13px;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+
+        .top-actions {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .status-indicators {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 6px 10px;
+            border-radius: 8px;
+            background: var(--surface-hover);
+            border: 1px solid var(--border-color);
+        }
+        .indicator.active { background: var(--primary-light); color: var(--primary-dark); }
+        .indicator.active-telegram { background: var(--telegram-light); color: var(--telegram-color); }
+        .indicator.inactive { background: var(--danger-light); color: var(--danger); }
+        .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+
+        .btn-action {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            padding: 8px 14px;
+            font-size: 12px;
+            font-weight: 600;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.2s;
+            color: var(--text-main);
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            text-decoration: none;
+        }
+        .btn-action:hover { background: var(--surface-hover); }
+        .btn-primary { background: var(--primary); color: #ffffff; border-color: var(--primary-dark); }
+        .btn-primary:hover { background: var(--primary-dark); }
+
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        .kpi-card {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            padding: 18px 20px;
+            box-shadow: var(--card-shadow);
+        }
+        .kpi-card .label {
+            font-size: 11px;
+            font-weight: 700;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .kpi-card .value {
+            font-size: 24px;
+            font-weight: 800;
+            font-family: 'JetBrains Mono', monospace;
+            font-variant-numeric: tabular-nums;
+            margin-top: 6px;
+            color: var(--text-main);
+        }
+        .kpi-card .subtext { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+
+        .filter-card {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            padding: 16px 20px;
+            margin-bottom: 20px;
+            box-shadow: var(--card-shadow);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .search-box { flex: 1; min-width: 240px; position: relative; }
+        .search-box input {
+            width: 100%;
+            padding: 10px 14px 10px 36px;
+            border-radius: 10px;
+            border: 1px solid var(--border-color);
+            background: var(--input-bg);
+            color: var(--text-main);
+            font-size: 13px;
+            outline: none;
+            transition: border 0.2s;
+        }
+        .search-box input:focus { border-color: var(--info); }
+        .search-icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--text-muted); font-size: 14px; }
+
+        .filter-selects { display: flex; gap: 10px; flex-wrap: wrap; }
+        .select-field {
+            padding: 10px 14px;
+            border-radius: 10px;
+            border: 1px solid var(--border-color);
+            background: var(--input-bg);
+            color: var(--text-main);
+            font-size: 12px;
+            font-weight: 600;
+            outline: none;
+            cursor: pointer;
+        }
+
+        .table-card {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: var(--card-shadow);
+        }
+        .table-header-title {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .table-header-title h2 { font-size: 15px; font-weight: 700; }
+
+        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
+        th {
+            background: var(--surface-hover);
+            padding: 12px 16px;
+            font-weight: 700;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border-color);
+            white-space: nowrap;
+        }
+        td { padding: 14px 16px; border-bottom: 1px solid var(--border-color); vertical-align: top; }
+        tr:hover td { background-color: var(--surface-hover); }
+
+        .font-mono { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
+        .font-bold { font-weight: 700; }
+        .text-right { text-align: right; }
+        .text-center { text-align: center; }
+        .text-muted { color: var(--text-muted); }
+
+        .badge { display: inline-block; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 700; }
+        .badge-success { background: var(--primary-light); color: var(--primary-dark); border: 1px solid rgba(16,185,129,0.3); }
+        .badge-error { background: var(--danger-light); color: var(--danger); border: 1px solid rgba(239,68,68,0.3); }
+        .badge-warning { background: rgba(245, 158, 11, 0.15); color: #d97706; border: 1px solid rgba(245, 158, 11, 0.3); }
+        .badge-info { background: var(--info-light); color: var(--info); border: 1px solid rgba(2, 132, 199, 0.3); }
+
+        .pagination-bar {
+            padding: 14px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top: 1px solid var(--border-color);
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .modal-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: var(--modal-overlay);
+            backdrop-filter: blur(4px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s;
+            padding: 20px;
+        }
+        .modal-overlay.active { opacity: 1; pointer-events: auto; }
+        .modal-card {
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            width: 100%;
+            max-width: 750px;
+            max-height: 90vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+            padding: 28px;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 20px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 16px;
+        }
+        .modal-header h2 { font-size: 18px; font-weight: 800; }
+        .modal-close {
+            background: var(--surface-hover);
+            border: none;
+            width: 32px; height: 32px;
+            border-radius: 50%;
+            cursor: pointer;
+            color: var(--text-muted);
+            font-size: 18px;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .json-pre {
+            background: #0f172a;
+            color: #38bdf8;
+            padding: 16px;
+            border-radius: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 450px;
+            border: 1px solid var(--border-color);
+        }
+
+        footer {
+            margin-top: 24px;
+            text-align: center;
+            font-size: 12px;
+            color: var(--text-muted);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="brand-zone">
+                <div class="brand-icon">📜</div>
+                <div class="title-group">
+                    <h1>Central de Logs & Telemetria do Sistema</h1>
+                    <p>Auditoria de Execuções, Erros, Rotações do Gemini e Webhooks</p>
+                </div>
+            </div>
+
+            <div class="top-actions">
+                <div class="status-indicators">
+                    <div class="indicator %SHEETS_OK_CLASS%">
+                        <span class="dot"></span> Sheets %SHEETS_OK_TEXT%
+                    </div>
+                    <div class="indicator %GEMINI_OK_CLASS%">
+                        <span class="dot"></span> Gemini AI %GEMINI_OK_TEXT%
+                    </div>
+                    <div class="indicator %TELEGRAM_OK_CLASS%">
+                        <span class="dot"></span> Telegram %TELEGRAM_OK_TEXT%
+                    </div>
+                </div>
+
+                <a href="/" class="btn-action">
+                    ⬅ Voltar ao Painel
+                </a>
+                <button class="btn-action" onclick="toggleTheme()" id="themeToggleBtn">
+                    🌙 Tema Escuro
+                </button>
+                <button class="btn-action" onclick="window.location.reload()">
+                    ↻ Atualizar
+                </button>
+            </div>
+        </header>
+
+        <!-- KPI Cards Grid -->
+        <div class="kpi-grid">
+            <div class="kpi-card">
+                <div class="label">Total de Registros de Logs</div>
+                <div class="value" style="color: var(--info);" id="kpiTotalLogs">%TOTAL_LOGS%</div>
+                <div class="subtext">Eventos registrados em memória</div>
+            </div>
+            <div class="kpi-card">
+                <div class="label">Sincronizados com Sucesso</div>
+                <div class="value" style="color: var(--primary);" id="kpiSucessosLogs">%SUCESSOS_SHEETS%</div>
+                <div class="subtext">Gravações na Planilha Google</div>
+            </div>
+            <div class="kpi-card">
+                <div class="label">Alertas e Falhas Detectadas</div>
+                <div class="value" style="color: %FALHAS_COLOR%;" id="kpiFalhasLogs">%FALHAS_LOGS%</div>
+                <div class="subtext">Imagens ilegíveis ou erros de API</div>
+            </div>
+            <div class="kpi-card">
+                <div class="label">Status Rotação Gemini</div>
+                <div class="value font-mono" style="font-size: 16px; margin-top: 6px;">Chave #%ACTIVE_KEY_INDEX% de %GEMINI_KEYS_COUNT%</div>
+                <div class="subtext">Alternância automática de cotas</div>
+            </div>
+        </div>
+
+        <!-- Filtros e Barra de Ações -->
+        <div class="filter-card">
+            <div class="search-box">
+                <span class="search-icon">🔍</span>
+                <input type="text" id="searchInput" placeholder="Buscar por mensagem, ID de log, usuário, erro ou estabelecimento..." oninput="onFilterChange()">
+            </div>
+
+            <div class="filter-selects">
+                <select id="statusGeminiSelect" class="select-field" onchange="onFilterChange()">
+                    <option value="">Status Gemini (Todos)</option>
+                    <option value="Sucesso">Sucesso</option>
+                    <option value="Processando">Processando</option>
+                    <option value="Ilegível">Ilegível</option>
+                    <option value="Falha">Falha</option>
+                    <option value="Comando">Comando</option>
+                </select>
+
+                <select id="statusSheetsSelect" class="select-field" onchange="onFilterChange()">
+                    <option value="">Status Planilha (Todos)</option>
+                    <option value="Enviado com Sucesso">Enviado com Sucesso</option>
+                    <option value="Ignorado">Ignorado / Duplicidade</option>
+                    <option value="Falha">Falha no Envio</option>
+                </select>
+
+                <button class="btn-action btn-primary" onclick="exportJSONLogs()">
+                    📥 Exportar JSON
+                </button>
+            </div>
+        </div>
+
+        <!-- Tabela de Logs do Sistema -->
+        <div class="table-card">
+            <div class="table-header-title">
+                <h2>Histórico Detalhado de Telemetria e Logs de Execução</h2>
+                <span class="text-muted" style="font-size: 12px;" id="rowCountInfo">Mostrando 0 registro(s)</span>
+            </div>
+            <div style="overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Data / Hora</th>
+                            <th>ID do Evento</th>
+                            <th>Origem / Usuário</th>
+                            <th>Status Gemini</th>
+                            <th>Status Planilha</th>
+                            <th>Estabelecimento / Erro</th>
+                            <th class="text-center">Ações</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tableBody">
+                        <!-- Table rows populated dynamically -->
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="pagination-bar">
+                <div id="pageInfoText">Página 1 de 1</div>
+                <div style="display: flex; gap: 6px;">
+                    <button class="btn-action" id="btnPrevPage" onclick="changePage(-1)">← Anterior</button>
+                    <button class="btn-action" id="btnNextPage" onclick="changePage(1)">Próxima →</button>
+                </div>
+            </div>
+        </div>
+
+        <footer>
+            <div>Auditor Fiscal AI · Central de Logs do Servidor (Node / FastAPI Pipeline)</div>
+            <div>Monitoramento em tempo real</div>
+        </footer>
+    </div>
+
+    <!-- Modal de JSON Completo do Log -->
+    <div class="modal-overlay" id="jsonModal" onclick="if(event.target===this) closeModal()">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div>
+                    <h2 id="modalLogTitle">Detalhes Brutos do Log (JSON)</h2>
+                    <p class="text-muted" style="font-size: 12px; margin-top: 2px;" id="modalLogSubtitle">Objeto de telemetria retornado pelo pipeline</p>
+                </div>
+                <button class="modal-close" onclick="closeModal()">✕</button>
+            </div>
+
+            <div>
+                <pre class="json-pre" id="jsonContainer"></pre>
+            </div>
+
+            <div style="margin-top: 24px; display: flex; justify-content: flex-end;">
+                <button class="btn-action" onclick="closeModal()">Fechar Visualização</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const rawLogs = %RAW_LOGS_JSON%;
+        let filteredLogs = [...rawLogs];
+        let currentPage = 1;
+        const pageSize = 15;
+
+        function updateThemeButtonText() {
+            const isDark = document.documentElement.classList.contains('dark');
+            const btn = document.getElementById('themeToggleBtn');
+            if (btn) {
+                btn.innerHTML = isDark ? '☀️ Tema Claro' : '🌙 Tema Escuro';
+            }
+        }
+
+        function toggleTheme() {
+            const isDark = document.documentElement.classList.contains('dark');
+            if (isDark) {
+                document.documentElement.classList.remove('dark');
+                localStorage.setItem('theme', 'light');
+            } else {
+                document.documentElement.classList.add('dark');
+                localStorage.setItem('theme', 'dark');
+            }
+            updateThemeButtonText();
+        }
+
+        function onFilterChange() {
+            const searchVal = document.getElementById('searchInput').value || '';
+            const searchText = searchVal.trim().toLowerCase();
+            const geminiStatus = document.getElementById('statusGeminiSelect').value;
+            const sheetsStatus = document.getElementById('statusSheetsSelect').value;
+
+            filteredLogs = rawLogs.filter(log => {
+                const matchSearch = !searchText ||
+                    (log.id || '').toLowerCase().includes(searchText) ||
+                    (log.timestamp || '').toLowerCase().includes(searchText) ||
+                    (log.username || '').toLowerCase().includes(searchText) ||
+                    (log.estabelecimento || '').toLowerCase().includes(searchText) ||
+                    (log.erro || '').toLowerCase().includes(searchText) ||
+                    (log.detalhes || '').toLowerCase().includes(searchText) ||
+                    (log.observacao || '').toLowerCase().includes(searchText);
+
+                const matchGemini = !geminiStatus || (log.status_gemini || '').includes(geminiStatus);
+                const matchSheets = !sheetsStatus || (log.status_sheets || '').includes(sheetsStatus);
+
+                return matchSearch && matchGemini && matchSheets;
+            });
+
+            currentPage = 1;
+            renderTable();
+        }
+
+        function renderTable() {
+            const tbody = document.getElementById('tableBody');
+            tbody.innerHTML = '';
+
+            const totalRows = filteredLogs.length;
+            document.getElementById('rowCountInfo').textContent = `${totalRows} registro(s) encontrado(s)`;
+
+            if (totalRows === 0) {
+                tbody.innerHTML = `
+                <tr>
+                    <td colspan="7" class="text-center" style="padding: 40px; color: var(--text-muted);">
+                        <div style="font-size: 28px; margin-bottom: 6px;">📜</div>
+                        <div style="font-weight:700;">Nenhum log corresponde aos filtros informados</div>
+                        <div style="font-size:12px; margin-top:4px;">Tente alterar o termo de busca ou resetar os filtros.</div>
+                    </td>
+                </tr>
+                `;
+                document.getElementById('pageInfoText').textContent = 'Página 0 de 0';
+                document.getElementById('btnPrevPage').disabled = true;
+                document.getElementById('btnNextPage').disabled = true;
+                return;
+            }
+
+            const maxPages = Math.ceil(totalRows / pageSize);
+            if (currentPage > maxPages) currentPage = maxPages;
+            if (currentPage < 1) currentPage = 1;
+
+            const startIndex = (currentPage - 1) * pageSize;
+            const pageLogs = filteredLogs.slice(startIndex, startIndex + pageSize);
+
+            pageLogs.forEach((log) => {
+                const tr = document.createElement('tr');
+
+                let geminiBadge = '';
+                const sg = log.status_gemini || '-';
+                if (sg === 'Sucesso') {
+                    geminiBadge = '<span class="badge badge-success">✓ Sucesso</span>';
+                } else if (sg === 'Ilegível') {
+                    geminiBadge = '<span class="badge badge-warning">⚠️ Ilegível</span>';
+                } else if (sg === 'Processando') {
+                    geminiBadge = '<span class="badge badge-info">⏳ Processando</span>';
+                } else if (sg === 'Comando') {
+                    geminiBadge = '<span class="badge badge-info">💬 Comando</span>';
+                } else {
+                    geminiBadge = `<span class="badge badge-error">✕ ${sg}</span>`;
+                }
+
+                let sheetsBadge = '';
+                const ss = log.status_sheets || '-';
+                if (ss === 'Enviado com Sucesso') {
+                    sheetsBadge = '<span class="badge badge-success">✓ Enviado</span>';
+                } else if (ss.includes('Ignorado') || ss.includes('Duplicidade')) {
+                    sheetsBadge = '<span class="badge badge-warning">⚠️ Ignorado</span>';
+                } else if (ss.includes('Gravando') || ss.includes('Pendente')) {
+                    sheetsBadge = `<span class="badge badge-info">⏳ ${ss}</span>`;
+                } else {
+                    sheetsBadge = `<span class="badge badge-error">✕ ${ss}</span>`;
+                }
+
+                const erroOrInfo = log.erro ? 
+                    `<div style="color:var(--danger); font-size:11px; font-weight:600; margin-top:2px;">⚠️ ${log.erro}</div>` : 
+                    (log.estabelecimento !== '-' ? `<div style="font-weight:600;">${log.estabelecimento}</div>` : '');
+
+                const userStr = log.username || log.responsavel || '-';
+
+                tr.innerHTML = `
+                    <td class="font-mono text-muted" style="font-size:12px;">${log.timestamp || '-'}</td>
+                    <td class="font-mono" style="font-size:11px; color:var(--text-muted);">${log.id || '-'}</td>
+                    <td><div class="font-bold">${userStr}</div><div class="text-muted" style="font-size:11px;">Chat ID: ${log.chat_id || '-'}</div></td>
+                    <td>${geminiBadge}</td>
+                    <td>${sheetsBadge}</td>
+                    <td style="max-width:320px;">${erroOrInfo}<div class="text-muted" style="font-size:11px; max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${log.origem_foto || log.detalhes || ''}</div></td>
+                    <td class="text-center">
+                        <button class="btn-action" style="padding:4px 8px; font-size:11px;" onclick="openLogModal('${log.id}')">
+                            📜 Ver JSON
+                        </button>
+                    </td>
+                `;
+
+                tbody.appendChild(tr);
+            });
+
+            document.getElementById('pageInfoText').textContent = `Página ${currentPage} de ${maxPages} (${totalRows} total)`;
+            document.getElementById('btnPrevPage').disabled = currentPage === 1;
+            document.getElementById('btnNextPage').disabled = currentPage === maxPages;
+        }
+
+        function changePage(delta) {
+            currentPage += delta;
+            renderTable();
+        }
+
+        function openLogModal(logId) {
+            const log = rawLogs.find(l => l.id === logId);
+            if (!log) return;
+
+            document.getElementById('modalLogTitle').textContent = `Log #${log.id}`;
+            document.getElementById('modalLogSubtitle').textContent = `Registrado em ${log.timestamp || ''} pelo usuário ${log.username || 'Sistema'}`;
+
+            document.getElementById('jsonContainer').textContent = JSON.stringify(log, null, 2);
+            document.getElementById('jsonModal').classList.add('active');
+        }
+
+        function closeModal() {
+            document.getElementById('jsonModal').classList.remove('active');
+        }
+
+        function exportJSONLogs() {
+            const blob = new Blob([JSON.stringify(filteredLogs, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `system_logs_${new Date().toISOString().slice(0, 10)}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeModal();
+        });
+
+        window.onload = function() {
+            updateThemeButtonText();
+            onFilterChange();
+        };
+    </script>
+</body>
+</html>
+"""
+
+    html_content = (
+        template
+        .replace("%SHEETS_OK_CLASS%", 'active' if sheets_ok else 'inactive')
+        .replace("%SHEETS_OK_TEXT%", 'Conectado' if sheets_ok else 'Pendente')
+        .replace("%GEMINI_OK_CLASS%", 'active' if gemini_ok else 'inactive')
+        .replace("%GEMINI_OK_TEXT%", 'Ativo' if gemini_ok else 'Sem Chave')
+        .replace("%TELEGRAM_OK_CLASS%", 'active-telegram' if telegram_ok else 'inactive')
+        .replace("%TELEGRAM_OK_TEXT%", 'Pronto' if telegram_ok else 'Sem Token')
+        .replace("%TOTAL_LOGS%", str(total_logs))
+        .replace("%SUCESSOS_SHEETS%", str(sucessos_sheets))
+        .replace("%FALHAS_LOGS%", str(falhas_count))
+        .replace("%FALHAS_COLOR%", 'var(--danger)' if falhas_count > 0 else 'var(--text-main)')
+        .replace("%ACTIVE_KEY_INDEX%", str(active_key_idx))
+        .replace("%GEMINI_KEYS_COUNT%", str(len(GEMINI_KEYS)))
+        .replace("%RAW_LOGS_JSON%", raw_logs_json)
+    )
+    return HTMLResponse(content=html_content, status_code=200)
+
 
 
