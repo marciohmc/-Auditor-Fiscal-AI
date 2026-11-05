@@ -260,9 +260,10 @@ def obter_nome_aba(data_str: str) -> str:
         nome_mes = MESES_PT[agora.month]
         return f"{nome_mes}_{agora.year}"
 
-def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "") -> tuple[int, str]:
+def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", observacao: str = "") -> tuple[int, str]:
     """
-    Grava o lançamento na aba mensal correspondente (ex: Novembro_2026).
+    Grava o lançamento na aba mensal correspondente (ex: Novembro_2026),
+    incluindo a coluna de Observação com a legenda enviada no Telegram.
     Se a aba não existir, cria automaticamente com cabeçalho formatado.
     """
     if not SPREADSHEET_ID:
@@ -280,7 +281,7 @@ def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "") -
     except Exception:
         try:
             worksheet = sh.add_worksheet(title=nome_aba, rows=100, cols=10)
-            cabecalho = ["Data", "Estabelecimento", "Tipo Documento", "Categoria", "Forma Pagamento", "Valor (R$)", "Comprovante"]
+            cabecalho = ["Data", "Estabelecimento", "Tipo Documento", "Categoria", "Forma Pagamento", "Valor (R$)", "Comprovante", "Observação"]
             worksheet.append_row(cabecalho, value_input_option='USER_ENTERED')
             logger.info(f"Nova aba criada com sucesso: {nome_aba}")
         except Exception as e_add:
@@ -316,7 +317,8 @@ def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "") -
         str(data.get("categoria", "Não Informado")),
         str(data.get("pagamento", "Não Informado")),
         float(data.get("valor", 0.0)),
-        formula_link
+        formula_link,
+        str(observacao or "")  # 8ª coluna: Observação (legenda da foto no Telegram)
     ]
 
     try:
@@ -434,7 +436,7 @@ def gerar_relatorio_mensal(nome_aba: str = None) -> str:
     relatorio += f"\n🔗 [Abrir Planilha no Google Sheets](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID})"
     return relatorio
 
-def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, file_id: str, lock_key: str):
+def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, file_id: str, lock_key: str, observacao: str = ""):
     """
     Executado em segundo plano (BackgroundTasks).
     Permite responder HTTP 200 ao Telegram em milissegundos e processar
@@ -453,6 +455,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
         "categoria": "-",
         "pagamento": "-",
         "valor": 0.0,
+        "observacao": observacao or None,
         "origem_foto": f"Telegram ID: {file_id[:10]}...",
         "erro": None,
         "detalhes": ""
@@ -525,14 +528,17 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             # Marca o status de gravação antes de iniciar o append para bloquear requisições paralelas
             log_entry["status_sheets"] = "Gravando na Planilha..."
 
-            # 5. Salva na planilha na aba mensal correspondente com o link direto da imagem
+            # 5. Salva na planilha na aba mensal correspondente com o link direto da imagem e observação
             try:
                 log_entry["link_telegram"] = url_direta_imagem
                 
-                total_linhas, nome_aba = append_to_sheet_aba_mensal(extracted_data, file_id, url_direta_imagem)
+                total_linhas, nome_aba = append_to_sheet_aba_mensal(extracted_data, file_id, url_direta_imagem, observacao=observacao)
                 log_entry["status_sheets"] = "Enviado com Sucesso"
                 log_entry["aba_planilha"] = nome_aba
-                log_entry["detalhes"] += f" | Aba: {nome_aba} | Linha: {total_linhas} | Imagem Direta: OK"
+                det_extra = f" | Aba: {nome_aba} | Linha: {total_linhas} | Imagem Direta: OK"
+                if observacao:
+                    det_extra += f" | Obs: {observacao}"
+                log_entry["detalhes"] += det_extra
             except Exception as e_sheets:
                 log_entry["status_sheets"] = "Falha no Envio"
                 log_entry["erro"] = f"Erro Google Sheets: {str(e_sheets)}"
@@ -548,9 +554,12 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             f"• *Categoria:* {extracted_data.get('categoria')}\n"
             f"• *Pagamento:* {extracted_data.get('pagamento')}\n"
             f"• *Valor:* R$ {float(extracted_data.get('valor', 0)):.2f}\n"
-            f"• *Aba Mensal:* `{nome_aba}`\n\n"
-            "📊 *Gravado na Planilha do Google Sheets!*"
+            f"• *Aba Mensal:* `{nome_aba}`"
         )
+        if observacao:
+            success_msg += f"\n• *Obs:* {observacao}"
+        success_msg += "\n\n📊 *Gravado na Planilha do Google Sheets!*"
+
         send_telegram_message(chat_id, success_msg, message_id)
 
     except Exception as e_all:
@@ -622,6 +631,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         if "photo" in message:
             largest_photo = message["photo"][-1]
             file_id = largest_photo["file_id"]
+            legenda_foto = message.get("caption", "").strip()
             lock_key = f"{chat_id}:{message_id}:{file_id}"
 
             if lock_key in in_progress_locks:
@@ -637,7 +647,8 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 message_id=message_id,
                 chat_user=str(chat_user),
                 file_id=file_id,
-                lock_key=lock_key
+                lock_key=lock_key,
+                observacao=legenda_foto
             )
 
         return Response(status_code=status.HTTP_200_OK)
@@ -712,10 +723,13 @@ def dashboard_logs_page():
             aba_nome = log.get("aba_planilha") or "Mensal"
             aba_badge = f'<span class="pill-category" style="background:#e0f2fe; color:#0369a1; border:1px solid #bae6fd; font-weight:700;">{aba_nome}</span>'
 
+            obs_text = log.get("observacao")
+            obs_html = f'<div style="font-size:11px; color:#475569; margin-top:3px; font-style:italic;">💬 Obs: {obs_text}</div>' if obs_text else ""
+
             rows_html += f"""
             <tr>
                 <td class="font-mono text-muted">{log.get("timestamp")}</td>
-                <td class="font-bold">{log.get("estabelecimento")}</td>
+                <td class="font-bold">{log.get("estabelecimento")}{obs_html}</td>
                 <td><span class="pill-category">{log.get("categoria")}</span></td>
                 <td>{log.get("tipo_documento")} / {log.get("pagamento")}</td>
                 <td class="text-center">{aba_badge}</td>

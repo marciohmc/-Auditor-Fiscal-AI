@@ -44,6 +44,7 @@ interface StoredFiscalEntry {
   }>;
   status_auditoria: 'auditado' | 'pendente' | 'divergencia';
   audit_notes?: string;
+  observacao?: string;
   imagem_url?: string;
   raw_json?: string;
   origem: 'upload' | 'camera' | 'telegram_webhook' | 'amostra';
@@ -565,6 +566,8 @@ app.post('/webhook', async (req: Request, res: Response) => {
         });
       }
 
+      const legendaFoto = (message.caption || req.body.caption || req.body.observacao || '').trim();
+
       // Create new fiscal entry matching user's append_to_sheet pipeline
       const newEntry: StoredFiscalEntry = {
         id: 'doc-' + Date.now(),
@@ -577,7 +580,8 @@ app.post('/webhook', async (req: Request, res: Response) => {
         cnpj: parsed.cnpj,
         itens: parsed.itens,
         status_auditoria: 'auditado',
-        audit_notes: `Lançamento automático via Telegram Webhook (Chat ID: ${chatId})`,
+        audit_notes: legendaFoto ? `Obs: ${legendaFoto}` : `Lançamento automático via Telegram Webhook (Chat ID: ${chatId})`,
+        observacao: legendaFoto || undefined,
         origem: 'telegram_webhook',
         criado_em: new Date().toISOString(),
         raw_json: rawText,
@@ -590,12 +594,12 @@ app.post('/webhook', async (req: Request, res: Response) => {
         timestamp: new Date().toISOString(),
         chat_id: chatId,
         origem: 'Telegram Webhook',
-        payload_summary: `Foto processada com sucesso: ${parsed.estabelecimento} - R$ ${parsed.valor.toFixed(2)}`,
+        payload_summary: `Foto processada com sucesso: ${parsed.estabelecimento} - R$ ${parsed.valor.toFixed(2)}${legendaFoto ? ` (Obs: ${legendaFoto})` : ''}`,
         status: 'sucesso',
         extracted_data: parsed,
       });
 
-      const confirmationText = 
+      let confirmationText = 
         `✅ *Lançamento Registrado com Sucesso!*\n\n` +
         `• *Data:* ${parsed.data}\n` +
         `• *Estabelecimento:* ${parsed.estabelecimento}\n` +
@@ -603,6 +607,10 @@ app.post('/webhook', async (req: Request, res: Response) => {
         `• *Categoria:* ${parsed.categoria}\n` +
         `• *Pagamento:* ${parsed.pagamento}\n` +
         `• *Valor:* R$ ${Number(parsed.valor).toFixed(2)}`;
+
+      if (legendaFoto) {
+        confirmationText += `\n• *Obs:* ${legendaFoto}`;
+      }
 
       return res.status(200).json({
         status: 'ok',
