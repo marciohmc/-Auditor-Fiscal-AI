@@ -431,7 +431,8 @@ def download_telegram_file(file_id: str) -> tuple[bytes, str]:
 
 def analyze_receipt(img_bytes: bytes) -> dict:
     """
-    Analisa o comprovante utilizando o cliente oficial da Hugging Face (huggingface_hub.InferenceClient).
+    Analisa o comprovante utilizando o cliente oficial da Hugging Face (huggingface_hub.InferenceClient)
+    com fallback automático e resiliente via requisição HTTP nativa.
     """
     if not HF_API_TOKEN:
         logger.error("HF_API_TOKEN não encontrado nas variáveis de ambiente.")
@@ -441,58 +442,67 @@ def analyze_receipt(img_bytes: bytes) -> dict:
         }
 
     data_hoje = datetime.now().strftime("%d/%m/%Y")
+    response_text = None
 
-    try:
-        if HF_HUB_AVAILABLE and InferenceClient is not None:
+    # 1. Tenta usar o cliente oficial huggingface_hub se disponível
+    if HF_HUB_AVAILABLE and InferenceClient is not None:
+        try:
             logger.info("Inicializando cliente oficial da Hugging Face (InferenceClient)...")
             client = InferenceClient(model="microsoft/Florence-2-large", token=HF_API_TOKEN)
             try:
-                response = client.image_to_text(img_bytes)
-                logger.info(f"Resposta da Hugging Face via InferenceClient (image_to_text): {response}")
-            except Exception as e_client:
-                logger.warning(f"image_to_text via InferenceClient falhou ou modelo requer POST direto ({e_client}). Executando chamada nativa do client...")
-                if hasattr(client, 'post'):
-                    res_bytes = client.post(data=img_bytes, model="microsoft/Florence-2-large")
-                    response = res_bytes.decode('utf-8') if isinstance(res_bytes, bytes) else str(res_bytes)
-                    logger.info(f"Resposta da Hugging Face via client.post: {response}")
-                else:
-                    raise e_client
-        else:
+                res = client.image_to_text(img_bytes)
+                response_text = str(res)
+                logger.info(f"Resposta via InferenceClient (image_to_text): {response_text}")
+            except Exception as e_itt:
+                logger.warning(f"InferenceClient.image_to_text falhou ({e_itt}). Tentando client.post com octet-stream...")
+                res_post = client.post(data=img_bytes, headers={"Content-Type": "application/octet-stream"})
+                response_text = res_post.decode('utf-8') if isinstance(res_post, bytes) else str(res_post)
+                logger.info(f"Resposta via client.post: {response_text}")
+        except Exception as e_hub:
+            logger.warning(f"Chamada via huggingface_hub falhou ({e_hub}). Acionando fallback nativo HTTP requests...")
+
+    # 2. Fallback nativo via requests.post caso o cliente hub falhe
+    if not response_text:
+        try:
+            logger.info("Executando requisição HTTP nativa para Hugging Face Inference API...")
             headers = {
                 "Authorization": f"Bearer {HF_API_TOKEN}",
                 "Content-Type": "application/octet-stream"
             }
-            res = requests.post(HF_MODEL_URL, headers=headers, data=img_bytes, timeout=30)
-            if res.status_code == 503:
+            res_http = requests.post(HF_MODEL_URL, headers=headers, data=img_bytes, timeout=30)
+            
+            if res_http.status_code == 503:
+                logger.warning("Modelo Hugging Face em aquecimento (Status 503).")
                 return {
                     "status_leitura": "ilegivel",
                     "mensagem_erro": "O modelo de IA está aquecendo na Hugging Face. Tente enviar a foto novamente em instantes."
                 }
-            if res.status_code != 200:
+            if res_http.status_code != 200:
+                logger.error(f"Erro na API Hugging Face HTTP: {res_http.status_code} - {res_http.text}")
                 return {
                     "status_leitura": "ilegivel",
-                    "mensagem_erro": f"Erro na API Hugging Face (Status {res.status_code})"
+                    "mensagem_erro": f"Erro na API Hugging Face (Status {res_http.status_code})"
                 }
-            logger.info(f"Resposta da Hugging Face via HTTP nativo: {res.text}")
+            response_text = res_http.text
+            logger.info(f"Resposta recebida via HTTP nativo com sucesso: {response_text}")
+        except Exception as e_req:
+            logger.error(f"Erro na requisição HTTP fallback: {str(e_req)}")
+            return {
+                "status_leitura": "ilegivel",
+                "mensagem_erro": f"Erro ao comunicar com a Hugging Face: {str(e_req)}"
+            }
 
-        return {
-            "status_leitura": "sucesso",
-            "mensagem_erro": None,
-            "data": data_hoje,
-            "estabelecimento": "Estabelecimento (Hugging Face)",
-            "tipo_documento": "Cupom Fiscal",
-            "categoria": "Outros",
-            "pagamento": "Não Informado",
-            "valor": 0.0,
-            "itens": []
-        }
-
-    except Exception as e:
-        logger.error(f"Erro na integração com Hugging Face Hub: {str(e)}")
-        return {
-            "status_leitura": "ilegivel",
-            "mensagem_erro": f"Erro ao comunicar com a Hugging Face: {str(e)}"
-        }
+    return {
+        "status_leitura": "sucesso",
+        "mensagem_erro": None,
+        "data": data_hoje,
+        "estabelecimento": "Estabelecimento (Hugging Face)",
+        "tipo_documento": "Cupom Fiscal",
+        "categoria": "Outros",
+        "pagamento": "Não Informado",
+        "valor": 0.0,
+        "itens": []
+    }
 
 def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> bool:
     """
