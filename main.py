@@ -462,7 +462,7 @@ def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
         "Retorne estritamente o JSON sem markdown fora do objeto."
     )
 
-    candidate_models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite", "gemini-1.5-flash"]
+    candidate_models = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-1.5-flash"]
     total_key_attempts = max(1, len(GEMINI_KEYS))
     last_err = None
 
@@ -802,8 +802,14 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
     """
     Executado em segundo plano (BackgroundTasks).
     Permite responder HTTP 200 ao Telegram em milissegundos e processar
-    análise de IA e inserção no Sheets de forma assíncrona, eliminando timeouts.
+    análise de IA e inserção no Sheets de forma assíncrona com medição exata de latência.
     """
+    t_start = time.time()
+    t_download = 0.0
+    t_gemini = 0.0
+    t_duplicidade = 0.0
+    t_sheets_write = 0.0
+
     timestamp_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     log_entry: Dict[str, Any] = {
         "id": f"log-{int(datetime.now().timestamp() * 1000)}",
@@ -820,6 +826,8 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
         "observacao": observacao or None,
         "responsavel": responsavel,
         "origem_foto": f"Telegram ID: {file_id[:10]}...",
+        "tempo_total_sec": 0.0,
+        "metricas_tempo": None,
         "erro": None,
         "detalhes": ""
     }
@@ -829,10 +837,15 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
         # 1. Envia aviso inicial amigável ao usuário
         send_telegram_message(chat_id, "🔍 Processando comprovante fiscal com Gemini...", message_id)
 
-        # 2. Download da imagem do Telegram e Análise com Gemini
+        # 2. Download da imagem do Telegram e Análise com Gemini (com cronometragem)
         try:
+            t_dl_start = time.time()
             img_bytes, url_direta_imagem = download_telegram_file(file_id)
+            t_download = time.time() - t_dl_start
+
+            t_gemini_start = time.time()
             extracted_data = analyze_receipt(img_bytes)
+            t_gemini = time.time() - t_gemini_start
 
             # 3. Verificação do status de leitura (se ilegível, notifica e encerra sem gravar)
             if extracted_data.get("status_leitura") == "ilegivel":
@@ -840,6 +853,15 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
                     "mensagem_erro",
                     "Não consegui ler os dados com clareza pois a imagem está borrada ou muito escura. Poderia enviar uma foto mais nítida, por favor?"
                 )
+                t_total = time.time() - t_start
+                log_entry["tempo_total_sec"] = round(t_total, 2)
+                log_entry["metricas_tempo"] = {
+                    "download_sec": round(t_download, 2),
+                    "gemini_sec": round(t_gemini, 2),
+                    "duplicidade_sec": 0.0,
+                    "sheets_write_sec": 0.0,
+                    "total_sec": round(t_total, 2)
+                }
                 log_entry["status_gemini"] = "Ilegível"
                 log_entry["status_sheets"] = "Não Enviado (Imagem Ilegível)"
                 log_entry["erro"] = mensagem_usuario
@@ -858,7 +880,9 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
 
         except Exception as e_gemini:
+            t_total = time.time() - t_start
             err_str = str(e_gemini)
+            log_entry["tempo_total_sec"] = round(t_total, 2)
             log_entry["status_gemini"] = "Falha"
             log_entry["status_sheets"] = "Cancelado (Erro Gemini)"
             log_entry["erro"] = f"Erro no Gemini: {err_str}"
@@ -875,35 +899,72 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             send_telegram_message(chat_id, friendly_error, message_id)
             return
 
-        # 4. Verificação de Duplicidade e Gravação com Thread Lock Exclusivo
+        # 4. Verificação de Duplicidade e Gravação com Thread Lock Exclusivo (com cronometragem)
         with sheets_write_lock:
-            if verificar_duplicidade(extracted_data):
+            t_dup_start = time.time()
+            e_duplicado = verificar_duplicidade(extracted_data)
+            t_duplicidade = time.time() - t_dup_start
+
+            if e_duplicado:
+                t_total = time.time() - t_start
                 alerta_duplicado = (
                     "⚠️ *Atenção: Comprovante Duplicado Detectado!*\n\n"
                     f"Já existe um registro recente para *{extracted_data.get('estabelecimento')}* "
                     f"no valor de *R$ {float(extracted_data.get('valor', 0)):.2f}* na data *{extracted_data.get('data')}*.\n\n"
                     "O lançamento foi ignorado para evitar duplicidade na planilha."
                 )
+                log_entry["tempo_total_sec"] = round(t_total, 2)
+                log_entry["metricas_tempo"] = {
+                    "download_sec": round(t_download, 2),
+                    "gemini_sec": round(t_gemini, 2),
+                    "duplicidade_sec": round(t_duplicidade, 2),
+                    "sheets_write_sec": 0.0,
+                    "total_sec": round(t_total, 2)
+                }
                 log_entry["status_sheets"] = "Ignorado (Duplicidade)"
                 log_entry["erro"] = "Comprovante idêntico já cadastrado recentemente"
                 send_telegram_message(chat_id, alerta_duplicado, message_id)
                 return
 
-            # Marca o status de gravação antes de iniciar o append para bloquear requisições paralelas
+            # Marca o status de gravação antes de iniciar o append
             log_entry["status_sheets"] = "Gravando na Planilha..."
 
-            # 5. Salva na planilha na aba mensal correspondente com o link direto da imagem, observação e responsável
+            # 5. Salva na planilha na aba mensal correspondente
             try:
                 log_entry["link_telegram"] = url_direta_imagem
                 
+                t_write_start = time.time()
                 total_linhas, nome_aba = append_to_sheet_aba_mensal(extracted_data, file_id, url_direta_imagem, observacao=observacao, responsavel=responsavel)
+                t_sheets_write = time.time() - t_write_start
+
+                t_total = time.time() - t_start
+                log_entry["tempo_total_sec"] = round(t_total, 2)
+                log_entry["metricas_tempo"] = {
+                    "download_sec": round(t_download, 2),
+                    "gemini_sec": round(t_gemini, 2),
+                    "duplicidade_sec": round(t_duplicidade, 2),
+                    "sheets_write_sec": round(t_sheets_write, 2),
+                    "total_sec": round(t_total, 2)
+                }
+
+                logger.info(
+                    f"⏱️ MEDIÇÃO DE PERFORMANCE (Log #{log_entry['id']}):\n"
+                    f"  • Download Telegram: {t_download:.2f}s\n"
+                    f"  • Análise Gemini IA: {t_gemini:.2f}s\n"
+                    f"  • Checagem Duplicidade: {t_duplicidade:.2f}s\n"
+                    f"  • Gravação no Sheets: {t_sheets_write:.2f}s\n"
+                    f"  • Tempo Total: {t_total:.2f}s"
+                )
+
                 log_entry["status_sheets"] = "Enviado com Sucesso"
                 log_entry["aba_planilha"] = nome_aba
-                det_extra = f" | Aba: {nome_aba} | Linha: {total_linhas} | Responsável: {responsavel} | Imagem Direta: OK"
+                det_extra = f" | Aba: {nome_aba} | Linha: {total_linhas} | Responsável: {responsavel} | Tempo Total: {t_total:.2f}s"
                 if observacao:
                     det_extra += f" | Obs: {observacao}"
                 log_entry["detalhes"] += det_extra
             except Exception as e_sheets:
+                t_total = time.time() - t_start
+                log_entry["tempo_total_sec"] = round(t_total, 2)
                 log_entry["status_sheets"] = "Falha no Envio"
                 log_entry["erro"] = f"Erro Google Sheets: {str(e_sheets)}"
                 logger.error(f"Erro ao salvar na planilha Google: {e_sheets}")
@@ -923,7 +984,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
         )
         if observacao:
             success_msg += f"\n• *Obs:* {observacao}"
-        success_msg += "\n\n📊 *Gravado na Planilha do Google Sheets!*"
+        success_msg += f"\n\n⚡ *Processado em {t_total:.1f}s* | 📊 *Gravado no Google Sheets!*"
 
         send_telegram_message(chat_id, success_msg, message_id)
 
@@ -2917,7 +2978,24 @@ def system_logs_page(request: Request):
             document.getElementById('modalLogTitle').textContent = `Log #${log.id}`;
             document.getElementById('modalLogSubtitle').textContent = `Registrado em ${log.timestamp || ''} pelo usuário ${log.username || 'Sistema'}`;
 
-            document.getElementById('jsonContainer').textContent = JSON.stringify(log, null, 2);
+            let timeHtml = '';
+            if (log.metricas_tempo) {
+                timeHtml = `
+                <div style="margin-bottom:16px; padding:12px; background:var(--surface-hover); border-radius:10px; border:1px solid var(--border-color); font-size:12px;">
+                    <div style="font-weight:700; margin-bottom:6px; color:var(--info);">⚡ MÉTRICAS DE DESEMPENHO E LATÊNCIA</div>
+                    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                        <div><b>📥 Download Telegram:</b> ${log.metricas_tempo.download_sec}s</div>
+                        <div><b>🧠 Análise Gemini IA:</b> ${log.metricas_tempo.gemini_sec}s</div>
+                        <div><b>🔍 Checagem Duplicidade:</b> ${log.metricas_tempo.duplicidade_sec}s</div>
+                        <div><b>✍️ Escrita Sheets:</b> ${log.metricas_tempo.sheets_write_sec}s</div>
+                        <div><b>⏱️ Tempo Total:</b> <span style="color:var(--primary); font-weight:800;">${log.metricas_tempo.total_sec}s</span></div>
+                    </div>
+                </div>
+                `;
+            }
+
+            const jsonContainer = document.getElementById('jsonContainer');
+            jsonContainer.innerHTML = timeHtml + '<pre style="margin:0; background:transparent; border:none; padding:0; color:inherit;">' + JSON.stringify(log, null, 2) + '</pre>';
             document.getElementById('jsonModal').classList.add('active');
         }
 
