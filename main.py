@@ -5,6 +5,7 @@ import time
 import threading
 import urllib.parse
 import hashlib
+import re
 from collections import OrderedDict
 from datetime import datetime
 from typing import Dict, Any, List, Set
@@ -37,6 +38,7 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 PASSCM = os.getenv("PASSCM", "").strip()
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 HF_MODEL_URL = os.getenv("HF_MODEL_URL", "https://api-inference.huggingface.co/models/microsoft/Florence-2-large")
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
 
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
@@ -431,78 +433,90 @@ def download_telegram_file(file_id: str) -> tuple[bytes, str]:
 
 def analyze_receipt(img_bytes: bytes) -> dict:
     """
-    Analisa o comprovante utilizando o cliente oficial da Hugging Face (huggingface_hub.InferenceClient)
-    com fallback automático e resiliente via requisição HTTP nativa.
+    Envia a imagem para a API do OCR.space e extrai os campos principais 
+    utilizando Regex no texto retornado.
     """
-    if not HF_API_TOKEN:
-        logger.error("HF_API_TOKEN não encontrado nas variáveis de ambiente.")
-        return {
-            "status_leitura": "ilegivel",
-            "mensagem_erro": "Token da Hugging Face (HF_API_TOKEN) não configurado no Render."
-        }
-
-    data_hoje = datetime.now().strftime("%d/%m/%Y")
-    response_text = None
-
-    # 1. Tenta usar o cliente oficial huggingface_hub se disponível
-    if HF_HUB_AVAILABLE and InferenceClient is not None:
-        try:
-            logger.info("Inicializando cliente oficial da Hugging Face (InferenceClient)...")
-            client = InferenceClient(model="microsoft/Florence-2-large", token=HF_API_TOKEN)
-            try:
-                res = client.image_to_text(img_bytes)
-                response_text = str(res)
-                logger.info(f"Resposta via InferenceClient (image_to_text): {response_text}")
-            except Exception as e_itt:
-                logger.warning(f"InferenceClient.image_to_text falhou ({e_itt}). Tentando client.post com octet-stream...")
-                res_post = client.post(data=img_bytes, headers={"Content-Type": "application/octet-stream"})
-                response_text = res_post.decode('utf-8') if isinstance(res_post, bytes) else str(res_post)
-                logger.info(f"Resposta via client.post: {response_text}")
-        except Exception as e_hub:
-            logger.warning(f"Chamada via huggingface_hub falhou ({e_hub}). Acionando fallback nativo HTTP requests...")
-
-    # 2. Fallback nativo via requests.post caso o cliente hub falhe
-    if not response_text:
-        try:
-            logger.info("Executando requisição HTTP nativa para Hugging Face Inference API...")
-            headers = {
-                "Authorization": f"Bearer {HF_API_TOKEN}",
-                "Content-Type": "application/octet-stream"
-            }
-            res_http = requests.post(HF_MODEL_URL, headers=headers, data=img_bytes, timeout=30)
-            
-            if res_http.status_code == 503:
-                logger.warning("Modelo Hugging Face em aquecimento (Status 503).")
-                return {
-                    "status_leitura": "ilegivel",
-                    "mensagem_erro": "O modelo de IA está aquecendo na Hugging Face. Tente enviar a foto novamente em instantes."
-                }
-            if res_http.status_code != 200:
-                logger.error(f"Erro na API Hugging Face HTTP: {res_http.status_code} - {res_http.text}")
-                return {
-                    "status_leitura": "ilegivel",
-                    "mensagem_erro": f"Erro na API Hugging Face (Status {res_http.status_code})"
-                }
-            response_text = res_http.text
-            logger.info(f"Resposta recebida via HTTP nativo com sucesso: {response_text}")
-        except Exception as e_req:
-            logger.error(f"Erro na requisição HTTP fallback: {str(e_req)}")
+    api_key = os.getenv("OCR_SPACE_API_KEY", "helloworld")
+    url = "https://api.ocr.space/parse/image"
+    
+    payload = {
+        'isOverlayRequired': False,
+        'apikey': api_key,
+        'language': 'por', # Define o idioma português para melhorar o reconhecimento
+    }
+    
+    files = {
+        'file': ('comprovante.jpg', img_bytes, 'image/jpeg')
+    }
+    
+    try:
+        logger.info("Enviando imagem para a API OCR.space...")
+        response = requests.post(url, data=payload, files=files, timeout=30)
+        resultado = response.json()
+        
+        if resultado.get("IsErroredOnProcessing"):
+            erro_msg = resultado.get("ErrorMessage", ["Erro desconhecido"])[0]
+            logger.error(f"Erro no OCR.space: {erro_msg}")
             return {
                 "status_leitura": "ilegivel",
-                "mensagem_erro": f"Erro ao comunicar com a Hugging Face: {str(e_req)}"
+                "mensagem_erro": f"Erro OCR: {erro_msg}"
+            }
+            
+        parsed_results = resultado.get("ParsedResults", [])
+        if not parsed_results:
+            return {
+                "status_leitura": "ilegivel",
+                "mensagem_erro": "Nenhum texto foi detectado na imagem."
+            }
+            
+        texto_bruto = parsed_results[0].get("ParsedText", "")
+        
+        if not texto_bruto.strip():
+            return {
+                "status_leitura": "ilegivel",
+                "mensagem_erro": "A imagem está muito ilegível ou sem texto legível."
             }
 
-    return {
-        "status_leitura": "sucesso",
-        "mensagem_erro": None,
-        "data": data_hoje,
-        "estabelecimento": "Estabelecimento (Hugging Face)",
-        "tipo_documento": "Cupom Fiscal",
-        "categoria": "Outros",
-        "pagamento": "Não Informado",
-        "valor": 0.0,
-        "itens": []
-    }
+        logger.info(f"Texto extraído via OCR.space com sucesso: {texto_bruto[:150]}...")
+
+        # --- PARSER EM PYTHON (Extração por Regex) ---
+        
+        # 1. Procura por valores monetários (ex: R$ 45,90 ou 45.90)
+        valor_match = re.search(r'(?:R\$\s*)?(\d+[\.,]\d{2})', texto_bruto)
+        valor = float(valor_match.group(1).replace(',', '.')) if valor_match else 0.0
+        
+        # 2. Procura por datas no formato DD/MM/AAAA
+        data_match = re.search(r'(\d{2}/\d{2}/\d{4})', texto_bruto)
+        data_str = data_match.group(1) if data_match else datetime.now().strftime("%d/%m/%Y")
+        
+        # 3. Estabelecimento (pega a primeira linha relevante do cupom como nome provável)
+        linhas = [l.strip() for l in texto_bruto.replace('\r\n', '\n').split('\n') if l.strip()]
+        estabelecimento = linhas[0] if linhas else "Estabelecimento Desconhecido"
+
+        return {
+            "status_leitura": "sucesso",
+            "mensagem_erro": None,
+            "data": data_str,
+            "estabelecimento": estabelecimento,
+            "tipo_documento": "Cupom Fiscal",
+            "categoria": "Geral",
+            "pagamento": "Não Informado",
+            "valor": valor,
+            "itens": []
+        }
+
+    except requests.exceptions.Timeout:
+        logger.error("Timeout ao conectar com o OCR.space.")
+        return {
+            "status_leitura": "ilegivel",
+            "mensagem_erro": "O serviço de OCR demorou muito para responder."
+        }
+    except Exception as e:
+        logger.error(f"Erro inesperado no OCR.space: {str(e)}")
+        return {
+            "status_leitura": "ilegivel",
+            "mensagem_erro": f"Erro ao processar OCR: {str(e)}"
+        }
 
 def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> bool:
     """
