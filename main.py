@@ -17,6 +17,13 @@ from google.oauth2.service_account import Credentials
 from google import genai
 from google.genai import types
 
+try:
+    from huggingface_hub import InferenceClient
+    HF_HUB_AVAILABLE = True
+except ImportError:
+    InferenceClient = None
+    HF_HUB_AVAILABLE = False
+
 # Configuração de Logs
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("finance-bot")
@@ -424,8 +431,7 @@ def download_telegram_file(file_id: str) -> tuple[bytes, str]:
 
 def analyze_receipt(img_bytes: bytes) -> dict:
     """
-    Substitui a chamada do Gemini pela Hugging Face Inference API (Florence-2-large)
-    utilizando a variável de ambiente HF_API_TOKEN.
+    Analisa o comprovante utilizando o cliente oficial da Hugging Face (huggingface_hub.InferenceClient).
     """
     if not HF_API_TOKEN:
         logger.error("HF_API_TOKEN não encontrado nas variáveis de ambiente.")
@@ -434,34 +440,40 @@ def analyze_receipt(img_bytes: bytes) -> dict:
             "mensagem_erro": "Token da Hugging Face (HF_API_TOKEN) não configurado no Render."
         }
 
-    headers = {
-        "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Content-Type": "application/octet-stream"
-    }
+    data_hoje = datetime.now().strftime("%d/%m/%Y")
 
     try:
-        logger.info(f"Enviando imagem ({len(img_bytes)} bytes) para a API da Hugging Face ({HF_MODEL_URL})...")
-        response = requests.post(HF_MODEL_URL, headers=headers, data=img_bytes, timeout=30)
-
-        # Trata o erro 503 comum quando o modelo está "aquecendo" na nuvem da Hugging Face
-        if response.status_code == 503:
-            logger.warning("Modelo da Hugging Face está carregando na memória (503).")
-            return {
-                "status_leitura": "ilegivel",
-                "mensagem_erro": "O modelo de IA está aquecendo na Hugging Face. Tente enviar a foto novamente em instantes."
+        if HF_HUB_AVAILABLE and InferenceClient is not None:
+            logger.info("Inicializando cliente oficial da Hugging Face (InferenceClient)...")
+            client = InferenceClient(model="microsoft/Florence-2-large", token=HF_API_TOKEN)
+            try:
+                response = client.image_to_text(img_bytes)
+                logger.info(f"Resposta da Hugging Face via InferenceClient (image_to_text): {response}")
+            except Exception as e_client:
+                logger.warning(f"image_to_text via InferenceClient falhou ou modelo requer POST direto ({e_client}). Executando chamada nativa do client...")
+                if hasattr(client, 'post'):
+                    res_bytes = client.post(data=img_bytes, model="microsoft/Florence-2-large")
+                    response = res_bytes.decode('utf-8') if isinstance(res_bytes, bytes) else str(res_bytes)
+                    logger.info(f"Resposta da Hugging Face via client.post: {response}")
+                else:
+                    raise e_client
+        else:
+            headers = {
+                "Authorization": f"Bearer {HF_API_TOKEN}",
+                "Content-Type": "application/octet-stream"
             }
-
-        if response.status_code != 200:
-            logger.error(f"Erro na API da Hugging Face: {response.status_code} - {response.text}")
-            return {
-                "status_leitura": "ilegivel",
-                "mensagem_erro": f"Erro na API Hugging Face (Status {response.status_code})"
-            }
-
-        resultado_api = response.json()
-        logger.info(f"Resposta recebida da Hugging Face com sucesso: {resultado_api}")
-
-        data_hoje = datetime.now().strftime("%d/%m/%Y")
+            res = requests.post(HF_MODEL_URL, headers=headers, data=img_bytes, timeout=30)
+            if res.status_code == 503:
+                return {
+                    "status_leitura": "ilegivel",
+                    "mensagem_erro": "O modelo de IA está aquecendo na Hugging Face. Tente enviar a foto novamente em instantes."
+                }
+            if res.status_code != 200:
+                return {
+                    "status_leitura": "ilegivel",
+                    "mensagem_erro": f"Erro na API Hugging Face (Status {res.status_code})"
+                }
+            logger.info(f"Resposta da Hugging Face via HTTP nativo: {res.text}")
 
         return {
             "status_leitura": "sucesso",
@@ -475,17 +487,11 @@ def analyze_receipt(img_bytes: bytes) -> dict:
             "itens": []
         }
 
-    except requests.exceptions.Timeout:
-        logger.error("Timeout ao conectar com a API da Hugging Face.")
-        return {
-            "status_leitura": "ilegivel",
-            "mensagem_erro": "A API da Hugging Face demorou muito para responder."
-        }
     except Exception as e:
-        logger.error(f"Erro inesperado na integração com Hugging Face: {str(e)}")
+        logger.error(f"Erro na integração com Hugging Face Hub: {str(e)}")
         return {
             "status_leitura": "ilegivel",
-            "mensagem_erro": f"Erro interno ao processar imagem: {str(e)}"
+            "mensagem_erro": f"Erro ao comunicar com a Hugging Face: {str(e)}"
         }
 
 def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> bool:
@@ -796,9 +802,9 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
 
     try:
         # 1. Envia aviso inicial amigável ao usuário
-        send_telegram_message(chat_id, "🔍 Processando comprovante fiscal com Gemini...", message_id)
+        send_telegram_message(chat_id, "🔍 Processando comprovante fiscal com IA (Hugging Face)...", message_id)
 
-        # 2. Download da imagem do Telegram e Análise com Gemini (com cronometragem)
+        # 2. Download da imagem do Telegram e Análise com Hugging Face (com cronometragem)
         try:
             t_dl_start = time.time()
             img_bytes, url_direta_imagem = download_telegram_file(file_id)
@@ -819,6 +825,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
                 log_entry["metricas_tempo"] = {
                     "download_sec": round(t_download, 2),
                     "gemini_sec": round(t_gemini, 2),
+                    "hf_sec": round(t_gemini, 2),
                     "duplicidade_sec": 0.0,
                     "sheets_write_sec": 0.0,
                     "total_sec": round(t_total, 2)
@@ -840,18 +847,18 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             log_entry["itens"] = extracted_data.get("itens", [])
             log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
 
-        except Exception as e_gemini:
+        except Exception as e_hf:
             t_total = time.time() - t_start
-            err_str = str(e_gemini)
+            err_str = str(e_hf)
             log_entry["tempo_total_sec"] = round(t_total, 2)
             log_entry["status_gemini"] = "Falha"
-            log_entry["status_sheets"] = "Cancelado (Erro Gemini)"
-            log_entry["erro"] = f"Erro no Gemini: {err_str}"
+            log_entry["status_sheets"] = "Cancelado (Erro Hugging Face)"
+            log_entry["erro"] = f"Erro na Hugging Face IA: {err_str}"
 
-            if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
+            if "503" in err_str or "aquecendo" in err_str.lower():
                 friendly_error = (
-                    "⏳ *Servidores do Google com Alta Demanda Temporária*\n\n"
-                    "A API do Gemini está momentaneamente sobrecarregada (Status 503).\n"
+                    "⏳ *Modelo de IA da Hugging Face Aquecendo*\n\n"
+                    "O modelo de visão computacional (Florence-2) está carregando na memória na Hugging Face (Status 503).\n"
                     "Por favor, aguarde 15 a 30 segundos e **envie a foto novamente**."
                 )
             else:
@@ -878,6 +885,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
                 log_entry["metricas_tempo"] = {
                     "download_sec": round(t_download, 2),
                     "gemini_sec": round(t_gemini, 2),
+                    "hf_sec": round(t_gemini, 2),
                     "duplicidade_sec": round(t_duplicidade, 2),
                     "sheets_write_sec": 0.0,
                     "total_sec": round(t_total, 2)
@@ -903,6 +911,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
                 log_entry["metricas_tempo"] = {
                     "download_sec": round(t_download, 2),
                     "gemini_sec": round(t_gemini, 2),
+                    "hf_sec": round(t_gemini, 2),
                     "duplicidade_sec": round(t_duplicidade, 2),
                     "sheets_write_sec": round(t_sheets_write, 2),
                     "total_sec": round(t_total, 2)
@@ -911,7 +920,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
                 logger.info(
                     f"⏱️ MEDIÇÃO DE PERFORMANCE (Log #{log_entry['id']}):\n"
                     f"  • Download Telegram: {t_download:.2f}s\n"
-                    f"  • Análise Gemini IA: {t_gemini:.2f}s\n"
+                    f"  • Análise Hugging Face IA: {t_gemini:.2f}s\n"
                     f"  • Checagem Duplicidade: {t_duplicidade:.2f}s\n"
                     f"  • Gravação no Sheets: {t_sheets_write:.2f}s\n"
                     f"  • Tempo Total: {t_total:.2f}s"
@@ -1061,9 +1070,11 @@ def get_logs_json():
         "total_logs": len(processing_logs),
         "spreadsheet_id_configured": bool(SPREADSHEET_ID),
         "credentials_configured": bool(GOOGLE_CREDENTIALS_JSON),
-        "gemini_configured": bool(GEMINI_KEYS),
-        "gemini_keys_count": len(GEMINI_KEYS),
-        "active_key_index": current_key_index % len(GEMINI_KEYS) if GEMINI_KEYS else 0,
+        "hf_configured": bool(HF_API_TOKEN),
+        "hf_model_url": HF_MODEL_URL,
+        "gemini_configured": bool(HF_API_TOKEN or GEMINI_KEYS),
+        "gemini_keys_count": 1 if HF_API_TOKEN else len(GEMINI_KEYS),
+        "active_key_index": 0,
         "logs": processing_logs
     }
 
@@ -1119,7 +1130,7 @@ def dashboard_logs_page(request: Request):
 
     # Status de configurações
     sheets_ok = bool(SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON)
-    gemini_ok = bool(GEMINI_KEYS)
+    gemini_ok = bool(HF_API_TOKEN or GEMINI_KEYS)
     telegram_ok = bool(TELEGRAM_BOT_TOKEN)
 
     sheet_id_display = "Não configurada"
@@ -1654,7 +1665,7 @@ def dashboard_logs_page(request: Request):
                         <span class="dot"></span> Sheets %SHEETS_OK_TEXT%
                     </div>
                     <div class="indicator %GEMINI_OK_CLASS%">
-                        <span class="dot"></span> Gemini AI %GEMINI_OK_TEXT%
+                        <span class="dot"></span> Hugging Face IA %GEMINI_OK_TEXT%
                     </div>
                     <div class="indicator %TELEGRAM_OK_CLASS%">
                         <span class="dot"></span> Telegram %TELEGRAM_OK_TEXT%
@@ -1793,7 +1804,7 @@ def dashboard_logs_page(request: Request):
             <div class="modal-header">
                 <div>
                     <h2 id="modalTitle">Detalhes do Comprovante Fiscal</h2>
-                    <p class="text-muted" style="font-size: 12px; margin-top: 2px;" id="modalSubtitle">Lançamento processado pelo Gemini AI</p>
+                    <p class="text-muted" style="font-size: 12px; margin-top: 2px;" id="modalSubtitle">Lançamento processado pela IA Hugging Face (Florence-2)</p>
                 </div>
                 <button class="modal-close" onclick="closeModal()">✕</button>
             </div>
@@ -2246,7 +2257,7 @@ def dashboard_logs_page(request: Request):
         .replace("%SHEETS_OK_CLASS%", 'active' if sheets_ok else 'inactive')
         .replace("%SHEETS_OK_TEXT%", 'Conectado' if sheets_ok else 'Pendente')
         .replace("%GEMINI_OK_CLASS%", 'active' if gemini_ok else 'inactive')
-        .replace("%GEMINI_OK_TEXT%", 'Ativo' if gemini_ok else 'Sem Chave')
+        .replace("%GEMINI_OK_TEXT%", 'Ativo' if gemini_ok else 'Sem Token')
         .replace("%TELEGRAM_OK_CLASS%", 'active-telegram' if telegram_ok else 'inactive')
         .replace("%TELEGRAM_OK_TEXT%", 'Pronto' if telegram_ok else 'Sem Token')
         .replace("%TOTAL_VALOR%", f"{total_valor:.2f}")
@@ -2270,10 +2281,11 @@ def system_logs_page(request: Request):
     falhas_count = sum(1 for log in processing_logs if log.get("erro") or "Falha" in str(log.get("status_sheets")) or "Falha" in str(log.get("status_gemini")))
 
     sheets_ok = bool(SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON)
-    gemini_ok = bool(GEMINI_KEYS)
+    gemini_ok = bool(HF_API_TOKEN or GEMINI_KEYS)
     telegram_ok = bool(TELEGRAM_BOT_TOKEN)
 
-    active_key_idx = (current_key_index % len(GEMINI_KEYS)) + 1 if GEMINI_KEYS else 0
+    active_key_idx = 1 if HF_API_TOKEN else (current_key_index % len(GEMINI_KEYS) + 1 if GEMINI_KEYS else 0)
+    hf_keys_count = 1 if HF_API_TOKEN else len(GEMINI_KEYS)
     raw_logs_json = json.dumps(processing_logs, ensure_ascii=False)
 
     template = """<!DOCTYPE html>
@@ -2644,7 +2656,7 @@ def system_logs_page(request: Request):
                 <div class="brand-icon">📜</div>
                 <div class="title-group">
                     <h1>Central de Logs & Telemetria do Sistema</h1>
-                    <p>Auditoria de Execuções, Erros, Rotações do Gemini e Webhooks</p>
+                    <p>Auditoria de Execuções, Erros, Chamadas Hugging Face e Webhooks</p>
                 </div>
             </div>
 
@@ -2654,7 +2666,7 @@ def system_logs_page(request: Request):
                         <span class="dot"></span> Sheets %SHEETS_OK_TEXT%
                     </div>
                     <div class="indicator %GEMINI_OK_CLASS%">
-                        <span class="dot"></span> Gemini AI %GEMINI_OK_TEXT%
+                        <span class="dot"></span> Hugging Face IA %GEMINI_OK_TEXT%
                     </div>
                     <div class="indicator %TELEGRAM_OK_CLASS%">
                         <span class="dot"></span> Telegram %TELEGRAM_OK_TEXT%
@@ -2691,9 +2703,9 @@ def system_logs_page(request: Request):
                 <div class="subtext">Imagens ilegíveis ou erros de API</div>
             </div>
             <div class="kpi-card">
-                <div class="label">Status Rotação Gemini</div>
-                <div class="value font-mono" style="font-size: 16px; margin-top: 6px;">Chave #%ACTIVE_KEY_INDEX% de %GEMINI_KEYS_COUNT%</div>
-                <div class="subtext">Alternância automática de cotas</div>
+                <div class="label">Status API Hugging Face</div>
+                <div class="value font-mono" style="font-size: 16px; margin-top: 6px;">%HF_STATUS_TEXT%</div>
+                <div class="subtext">Modelo Florence-2 Inference API</div>
             </div>
         </div>
 
@@ -2706,7 +2718,7 @@ def system_logs_page(request: Request):
 
             <div class="filter-selects">
                 <select id="statusGeminiSelect" class="select-field" onchange="onFilterChange()">
-                    <option value="">Status Gemini (Todos)</option>
+                    <option value="">Status IA / HF (Todos)</option>
                     <option value="Sucesso">Sucesso</option>
                     <option value="Processando">Processando</option>
                     <option value="Ilegível">Ilegível</option>
@@ -2740,7 +2752,7 @@ def system_logs_page(request: Request):
                             <th>Data / Hora</th>
                             <th>ID do Evento</th>
                             <th>Origem / Usuário</th>
-                            <th>Status Gemini</th>
+                            <th>Status Hugging Face</th>
                             <th>Status Planilha</th>
                             <th>Estabelecimento / Erro</th>
                             <th class="text-center">Ações</th>
@@ -2946,7 +2958,7 @@ def system_logs_page(request: Request):
                     <div style="font-weight:700; margin-bottom:6px; color:var(--info);">⚡ MÉTRICAS DE DESEMPENHO E LATÊNCIA</div>
                     <div style="display:flex; gap:12px; flex-wrap:wrap;">
                         <div><b>📥 Download Telegram:</b> ${log.metricas_tempo.download_sec}s</div>
-                        <div><b>🧠 Análise Gemini IA:</b> ${log.metricas_tempo.gemini_sec}s</div>
+                        <div><b>🧠 Análise Hugging Face IA:</b> ${(log.metricas_tempo.hf_sec || log.metricas_tempo.gemini_sec || 0)}s</div>
                         <div><b>🔍 Checagem Duplicidade:</b> ${log.metricas_tempo.duplicidade_sec}s</div>
                         <div><b>✍️ Escrita Sheets:</b> ${log.metricas_tempo.sheets_write_sec}s</div>
                         <div><b>⏱️ Tempo Total:</b> <span style="color:var(--primary); font-weight:800;">${log.metricas_tempo.total_sec}s</span></div>
@@ -2992,15 +3004,16 @@ def system_logs_page(request: Request):
         .replace("%SHEETS_OK_CLASS%", 'active' if sheets_ok else 'inactive')
         .replace("%SHEETS_OK_TEXT%", 'Conectado' if sheets_ok else 'Pendente')
         .replace("%GEMINI_OK_CLASS%", 'active' if gemini_ok else 'inactive')
-        .replace("%GEMINI_OK_TEXT%", 'Ativo' if gemini_ok else 'Sem Chave')
+        .replace("%GEMINI_OK_TEXT%", 'Ativo' if gemini_ok else 'Sem Token')
         .replace("%TELEGRAM_OK_CLASS%", 'active-telegram' if telegram_ok else 'inactive')
         .replace("%TELEGRAM_OK_TEXT%", 'Pronto' if telegram_ok else 'Sem Token')
         .replace("%TOTAL_LOGS%", str(total_logs))
         .replace("%SUCESSOS_SHEETS%", str(sucessos_sheets))
         .replace("%FALHAS_LOGS%", str(falhas_count))
         .replace("%FALHAS_COLOR%", 'var(--danger)' if falhas_count > 0 else 'var(--text-main)')
+        .replace("%HF_STATUS_TEXT%", 'Florence-2 (Ativo)' if gemini_ok else 'HF Token Ausente')
         .replace("%ACTIVE_KEY_INDEX%", str(active_key_idx))
-        .replace("%GEMINI_KEYS_COUNT%", str(len(GEMINI_KEYS)))
+        .replace("%GEMINI_KEYS_COUNT%", str(hf_keys_count))
         .replace("%RAW_LOGS_JSON%", raw_logs_json)
     )
     return HTMLResponse(content=html_content, status_code=200)
