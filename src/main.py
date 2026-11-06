@@ -28,6 +28,8 @@ GEMINI_API_KEY_1 = os.getenv("GEMINI_API_KEY_1")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 PASSCM = os.getenv("PASSCM", "").strip()
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+HF_MODEL_URL = os.getenv("HF_MODEL_URL", "https://api-inference.huggingface.co/models/microsoft/Florence-2-large")
 
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
@@ -420,112 +422,71 @@ def download_telegram_file(file_id: str) -> tuple[bytes, str]:
     file_res = requests.get(download_url, timeout=30)
     return file_res.content, download_url
 
-def analyze_receipt(image_bytes: bytes) -> Dict[str, Any]:
-    global current_key_index
+def analyze_receipt(img_bytes: bytes) -> dict:
+    """
+    Substitui a chamada do Gemini pela Hugging Face Inference API (Florence-2-large)
+    utilizando a variável de ambiente HF_API_TOKEN.
+    """
+    if not HF_API_TOKEN:
+        logger.error("HF_API_TOKEN não encontrado nas variáveis de ambiente.")
+        return {
+            "status_leitura": "ilegivel",
+            "mensagem_erro": "Token da Hugging Face (HF_API_TOKEN) não configurado no Render."
+        }
 
-    system_instruction = (
-        "Você é um auditor financeiro e especialista em extração multimodal de dados de documentos fiscais "
-        "(notas fiscais, cupons fiscais e recibos). Sua tarefa é analisar a imagem enviada e extrair com precisão "
-        "os dados financeiros e a lista de itens comprados, se houver, retornando estritamente um JSON padronizado."
-    )
-    
-    user_prompt = (
-        "Analise esta imagem de documento fiscal conforme as regras abaixo:\n\n"
-        "1. VALIDAÇÃO DE LEGIBILIDADE (CRÍTICO):\n"
-        "- Se a imagem estiver borrada, muito escura, cortada ou se os dados principais (valor total, estabelecimento ou data) "
-        "estiverem completamente ilegíveis, defina 'status_leitura': 'ilegivel' e forneça uma justificativa amigável em 'mensagem_erro'.\n"
-        "- Se a imagem for legível, defina 'status_leitura': 'sucesso' e 'mensagem_erro': null.\n\n"
-        "2. CLASSIFICAÇÃO DO DOCUMENTO:\n"
-        "- 'tipo_documento': 'Nota Fiscal', 'Cupom Fiscal' ou 'Recibo'.\n"
-        "- 'categoria': 'Alimentação', 'Transporte', 'Saúde', 'Lazer', 'Moradia', 'Veículo', 'Educação' ou 'Outros'.\n"
-        "- 'pagamento': 'PIX', 'Cartão de Crédito', 'Cartão de Débito', 'Dinheiro', 'Boleto' ou 'Não Informado'.\n\n"
-        "3. EXTRAÇÃO DE ITENS DETALHADOS:\n"
-        "- Extraia a lista de itens comprados no array 'itens' com 'descricao', 'quantidade' (float/int) e 'valor_total_item' (float).\n"
-        "- Se a nota não discriminar itens individuais, retorne lista vazia [].\n\n"
-        "4. FORMATAÇÃO E TIPAGEM:\n"
-        "- 'valor': float do valor total líquido (ex: 125.50).\n"
-        "- 'data': padrão DD/MM/AAAA.\n\n"
-        "Estrutura JSON esperada:\n"
-        "{\n"
-        '  "status_leitura": "sucesso",\n'
-        '  "mensagem_erro": null,\n'
-        '  "tipo_documento": "Nota Fiscal / Cupom Fiscal / Recibo",\n'
-        '  "data": "DD/MM/AAAA",\n'
-        '  "estabelecimento": "Nome do Estabelecimento",\n'
-        '  "valor": 0.00,\n'
-        '  "categoria": "Alimentação / Transporte / Saúde / Lazer / Moradia / Veículo / Educação / Outros",\n'
-        '  "pagamento": "PIX / Cartão de Crédito / Cartão de Débito / Dinheiro / Boleto / Não Informado",\n'
-        '  "itens": [\n'
-        '    {"descricao": "Item 1", "quantidade": 1, "valor_total_item": 10.00}\n'
-        '  ]\n'
-        "}\n\n"
-        "Retorne estritamente o JSON sem markdown fora do objeto."
-    )
-
-    candidate_models = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-1.5-flash"]
-    total_key_attempts = max(1, len(GEMINI_KEYS))
-    last_err = None
-
-    for key_attempt in range(total_key_attempts):
-        client = get_gemini_client()
-        active_key_idx = current_key_index % len(GEMINI_KEYS) if GEMINI_KEYS else 0
-
-        for model_name in candidate_models:
-            for attempt in range(1, 3):
-                try:
-                    logger.info(f"Tentativa {attempt}/2 com chave #{active_key_idx + 1} usando modelo {model_name}...")
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=[
-                            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                            user_prompt
-                        ],
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_instruction,
-                            response_mime_type="application/json"
-                        )
-                    )
-                    raw_text = response.text.strip()
-                    if raw_text.startswith("```json"):
-                        raw_text = raw_text[7:]
-                    if raw_text.startswith("```"):
-                        raw_text = raw_text[3:]
-                    if raw_text.endswith("```"):
-                        raw_text = raw_text[:-3]
-
-                    parsed = json.loads(raw_text.strip())
-                    logger.info(f"Extração bem sucedida com {model_name} usando chave #{active_key_idx + 1}")
-                    return parsed
-                except Exception as err:
-                    err_str = str(err)
-                    last_err = err
-                    logger.warning(f"Chave #{active_key_idx + 1}, modelo {model_name} falhou: {err_str}")
-
-                    # Se atingir erro 429 ou cota esgotada (RESOURCE_EXHAUSTED), rotaciona para a próxima chave
-                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "Quota" in err_str or "quota" in err_str:
-                        rotate_gemini_key()
-                        break
-
-                    # Se o modelo não existir ou for descontinuado (404), pula para o próximo modelo
-                    if "404" in err_str or "NOTFOUND" in err_str or "no longer available" in err_str:
-                        logger.info(f"Modelo {model_name} descontinuado ou não encontrado. Pulando para o próximo...")
-                        break
-                    
-                    # Se for erro 503 UNAVAILABLE ou alta demanda, aguarda e re-tenta
-                    if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
-                        wait_time = attempt * 2.0
-                        logger.info(f"Alta demanda temporária da Google detectada. Aguardando {wait_time}s...")
-                        time.sleep(wait_time)
-                    else:
-                        break
-            else:
-                continue
-            break
-
-    return {
-        "status_leitura": "ilegivel",
-        "mensagem_erro": "Todas as chaves do Gemini (GEMINI_API_KEY e GEMINI_API_KEY_1) atingiram o limite diário de cota."
+    headers = {
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Content-Type": "application/octet-stream"
     }
+
+    try:
+        logger.info(f"Enviando imagem ({len(img_bytes)} bytes) para a API da Hugging Face ({HF_MODEL_URL})...")
+        response = requests.post(HF_MODEL_URL, headers=headers, data=img_bytes, timeout=30)
+
+        # Trata o erro 503 comum quando o modelo está "aquecendo" na nuvem da Hugging Face
+        if response.status_code == 503:
+            logger.warning("Modelo da Hugging Face está carregando na memória (503).")
+            return {
+                "status_leitura": "ilegivel",
+                "mensagem_erro": "O modelo de IA está aquecendo na Hugging Face. Tente enviar a foto novamente em instantes."
+            }
+
+        if response.status_code != 200:
+            logger.error(f"Erro na API da Hugging Face: {response.status_code} - {response.text}")
+            return {
+                "status_leitura": "ilegivel",
+                "mensagem_erro": f"Erro na API Hugging Face (Status {response.status_code})"
+            }
+
+        resultado_api = response.json()
+        logger.info(f"Resposta recebida da Hugging Face com sucesso: {resultado_api}")
+
+        data_hoje = datetime.now().strftime("%d/%m/%Y")
+
+        return {
+            "status_leitura": "sucesso",
+            "mensagem_erro": None,
+            "data": data_hoje,
+            "estabelecimento": "Estabelecimento (Hugging Face)",
+            "tipo_documento": "Cupom Fiscal",
+            "categoria": "Outros",
+            "pagamento": "Não Informado",
+            "valor": 0.0,
+            "itens": []
+        }
+
+    except requests.exceptions.Timeout:
+        logger.error("Timeout ao conectar com a API da Hugging Face.")
+        return {
+            "status_leitura": "ilegivel",
+            "mensagem_erro": "A API da Hugging Face demorou muito para responder."
+        }
+    except Exception as e:
+        logger.error(f"Erro inesperado na integração com Hugging Face: {str(e)}")
+        return {
+            "status_leitura": "ilegivel",
+            "mensagem_erro": f"Erro interno ao processar imagem: {str(e)}"
+        }
 
 def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> bool:
     """
