@@ -13,11 +13,19 @@ from typing import Dict, Any, List, Set
 from fastapi import FastAPI, Request, Response, BackgroundTasks, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import requests
+import io
 import gspread
 from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 from google import genai
 from google.genai import types
+
+try:
+    from pypdf import PdfReader
+    PYPDF_AVAILABLE = True
+except ImportError:
+    PdfReader = None
+    PYPDF_AVAILABLE = False
 
 try:
     from huggingface_hub import InferenceClient
@@ -462,151 +470,171 @@ def download_telegram_file(file_id: str) -> tuple[bytes, str]:
     file_res = requests.get(download_url, timeout=30)
     return file_res.content, download_url
 
-def analyze_receipt(img_bytes: bytes) -> dict:
+def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
     """
-    Envia a imagem para o OCR.space e realiza a extração avançada 
-    de múltiplos campos incluindo Detalhes Financeiros & Operacionais (Hora, Desconto, Troco, Bandeira, Tributos).
+    Analisa comprovante (foto ou PDF de nota fiscal).
+    Se for PDF, tenta extração nativa digital via pypdf (em milissegundos).
+    Se for foto ou PDF escaneado, realiza OCR via OCR.space.
     """
-    api_key = os.getenv("OCR_SPACE_API_KEY", "helloworld")
-    url = "https://api.ocr.space/parse/image"
-    
-    payload = {
-        'isOverlayRequired': False,
-        'apikey': api_key,
-        'language': 'por',
-    }
-    
-    files = {
-        'file': ('comprovante.jpg', img_bytes, 'image/jpeg')
-    }
-    
-    try:
-        logger.info("Enviando imagem para o OCR.space para análise avançada...")
-        response = requests.post(url, data=payload, files=files, timeout=30)
-        resultado = response.json()
+    texto_bruto = ""
+
+    # 1. Se for arquivo PDF, tenta extração nativa digital em memória via pypdf
+    if is_pdf and PYPDF_AVAILABLE and PdfReader is not None:
+        try:
+            logger.info("Tentando extração de texto digital do PDF via pypdf...")
+            reader = PdfReader(io.BytesIO(file_bytes))
+            pypdf_text = ""
+            for page in reader.pages:
+                extracted = page.extract_text()
+                if extracted:
+                    pypdf_text += extracted + "\n"
+            if len(pypdf_text.strip()) >= 15:
+                texto_bruto = pypdf_text.strip()
+                logger.info(f"Texto do PDF extraído digitalmente com sucesso ({len(texto_bruto)} chars)!")
+        except Exception as e_pdf:
+            logger.warning(f"Extração nativa do PDF via pypdf falhou ({e_pdf}). Acionando OCR.space...")
+
+    # 2. Se não for PDF ou se a extração nativa digital retornou vazia, usa a API OCR.space
+    if not texto_bruto:
+        api_key = os.getenv("OCR_SPACE_API_KEY", "helloworld")
+        url = "https://api.ocr.space/parse/image"
         
-        if resultado.get("IsErroredOnProcessing"):
-            erro_msg = resultado.get("ErrorMessage", ["Erro desconhecido"])[0]
-            logger.error(f"Erro no OCR.space: {erro_msg}")
-            return {"status_leitura": "ilegivel", "mensagem_erro": f"Erro OCR: {erro_msg}"}
-            
-        parsed_results = resultado.get("ParsedResults", [])
-        if not parsed_results:
-            return {"status_leitura": "ilegivel", "mensagem_erro": "Nenhum texto detectado na imagem."}
-            
-        texto_bruto = parsed_results[0].get("ParsedText", "")
-        if not texto_bruto.strip():
-            return {"status_leitura": "ilegivel", "mensagem_erro": "Imagem ilegível ou sem texto."}
-
-        logger.info(f"Texto bruto capturado via OCR.space:\n{texto_bruto[:200]}...")
-
-        # Limpa as linhas do texto
-        linhas = [l.strip() for l in texto_bruto.replace('\r\n', '\n').split('\n') if l.strip()]
-        
-        # --- EXTRAÇÃO AVANÇADA POR PADRÕES (REGEX & OPERACIONAIS) ---
-        
-        # 1. Estabelecimento (Geralmente a primeira linha relevante)
-        estabelecimento = linhas[0] if linhas else "Desconhecido"
-        
-        # 2. Data (Procura formato DD/MM/AAAA ou DD/MM/AA)
-        data_match = re.search(r'(\d{2}/\d{2}/\d{4})', texto_bruto)
-        if data_match:
-            data_str = data_match.group(1)
-        else:
-            data_match_curta = re.search(r'(\d{2}/\d{2}/\d{2})', texto_bruto)
-            if data_match_curta:
-                d_partes = data_match_curta.group(1).split('/')
-                data_str = f"{d_partes[0]}/{d_partes[1]}/20{d_partes[2]}"
-            else:
-                data_str = datetime.now().strftime("%d/%m/%Y")
-
-        # 2b. Hora da Compra / Emissão
-        hora_match = re.search(r'(\d{2}:\d{2}(?::\d{2})?)', texto_bruto)
-        hora_str = hora_match.group(1) if hora_match else "Não Informada"
-        
-        # 3. Valor Total (Procura por termos como 'TOTAL', 'VALOR A PAGAR' ou pega o último valor do cupom)
-        valor_match = re.search(r'(?:TOTAL|VALOR A PAGAR|PAGAR|R\$\s*)[\s:]*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
-        if not valor_match:
-            valores = re.findall(r'(\d+[\.,]\d{2})', texto_bruto)
-            valor = float(valores[-1].replace(',', '.')) if valores else 0.0
-        else:
-            try:
-                valor = float(valor_match.group(1).replace(',', '.'))
-            except ValueError:
-                valor = 0.0
-
-        # 3b. Valor de Desconto
-        desconto_match = re.search(r'(?:DESCONTO|DESC|ABATIMENTO)[\s:]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
-        desconto_val = float(desconto_match.group(1).replace(',', '.')) if desconto_match else 0.0
-
-        # 3c. Valor de Troco
-        troco_match = re.search(r'(?:TROCO)[\s:]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
-        troco_val = float(troco_match.group(1).replace(',', '.')) if troco_match else 0.0
-
-        # 3d. Impostos / Tributos Aproximados
-        trib_match = re.search(r'(?:TRIB|TRIBUTOS|IMPOSTO|IBPT)[\s\w]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
-        trib_val = float(trib_match.group(1).replace(',', '.')) if trib_match else 0.0
-
-        # 4. CNPJ (Padrão XX.XXX.XXX/XXXX-XX)
-        cnpj_match = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', texto_bruto)
-        cnpj = cnpj_match.group(0) if cnpj_match else ""
-        if cnpj:
-            estabelecimento = f"{estabelecimento} (CNPJ: {cnpj})"
-
-        # 5. Forma de Pagamento & Bandeira do Cartão
-        texto_upper = texto_bruto.upper()
-        pagamento = "Não Informado"
-        if "PIX" in texto_upper:
-            pagamento = "Pix"
-        elif "CREDITO" in texto_upper or "CRÉDITO" in texto_upper:
-            pagamento = "Cartão de Crédito"
-        elif "DEBITO" in texto_upper or "DÉBITO" in texto_upper:
-            pagamento = "Cartão de Débito"
-        elif "DINHEIRO" in texto_upper:
-            pagamento = "Dinheiro"
-
-        bandeira_str = "Não Informada"
-        if "VISA" in texto_upper:
-            bandeira_str = "Visa"
-        elif "MASTERCARD" in texto_upper or "MASTER" in texto_upper:
-            bandeira_str = "Mastercard"
-        elif "ELO" in texto_upper:
-            bandeira_str = "Elo"
-        elif "AMEX" in texto_upper or "AMERICAN" in texto_upper:
-            bandeira_str = "Amex"
-        elif "HIPERCARD" in texto_upper or "HIPER" in texto_upper:
-            bandeira_str = "Hipercard"
-
-        # 6. Tipo de Documento
-        tipo_doc = "Cupom Fiscal"
-        if "NFC-E" in texto_upper or "NOTA FISCAL" in texto_upper:
-            tipo_doc = "Nota Fiscal Eletrônica"
-        elif "RECIBO" in texto_upper:
-            tipo_doc = "Recibo"
-
-        return {
-            "status_leitura": "sucesso",
-            "mensagem_erro": None,
-            "data": data_str,
-            "hora": hora_str,
-            "estabelecimento": estabelecimento,
-            "tipo_documento": tipo_doc,
-            "categoria": "Geral",
-            "pagamento": pagamento,
-            "bandeira": bandeira_str,
-            "valor": valor,
-            "desconto": desconto_val,
-            "troco": troco_val,
-            "tributos": trib_val,
-            "itens": []
+        payload = {
+            'isOverlayRequired': False,
+            'apikey': api_key,
+            'language': 'por',
         }
+        if is_pdf:
+            payload['filetype'] = 'PDF'
+            files = {'file': ('nota_fiscal.pdf', file_bytes, 'application/pdf')}
+        else:
+            files = {'file': ('comprovante.jpg', file_bytes, 'image/jpeg')}
 
-    except requests.exceptions.Timeout:
-        logger.error("Timeout ao conectar com o OCR.space.")
-        return {"status_leitura": "ilegivel", "mensagem_erro": "O serviço de OCR demorou muito para responder."}
-    except Exception as e:
-        logger.error(f"Erro no processamento do OCR: {str(e)}")
-        return {"status_leitura": "ilegivel", "mensagem_erro": f"Erro interno ao processar OCR: {str(e)}"}
+        try:
+            logger.info("Enviando arquivo para a API OCR.space...")
+            response = requests.post(url, data=payload, files=files, timeout=30)
+            resultado = response.json()
+            
+            if resultado.get("IsErroredOnProcessing"):
+                erro_msg = resultado.get("ErrorMessage", ["Erro desconhecido"])[0]
+                logger.error(f"Erro no OCR.space: {erro_msg}")
+                return {"status_leitura": "ilegivel", "mensagem_erro": f"Erro OCR: {erro_msg}"}
+                
+            parsed_results = resultado.get("ParsedResults", [])
+            if not parsed_results:
+                return {"status_leitura": "ilegivel", "mensagem_erro": "Nenhum texto detectado no documento."}
+                
+            texto_bruto = parsed_results[0].get("ParsedText", "")
+            if not texto_bruto.strip():
+                return {"status_leitura": "ilegivel", "mensagem_erro": "Documento ilegível ou sem texto."}
+
+            logger.info(f"Texto bruto capturado via OCR.space:\n{texto_bruto[:200]}...")
+
+        except requests.exceptions.Timeout:
+            logger.error("Timeout ao conectar com o OCR.space.")
+            return {"status_leitura": "ilegivel", "mensagem_erro": "O serviço de OCR demorou muito para responder."}
+        except Exception as e:
+            logger.error(f"Erro no processamento do OCR: {str(e)}")
+            return {"status_leitura": "ilegivel", "mensagem_erro": f"Erro interno ao processar OCR: {str(e)}"}
+
+    # --- EXTRAÇÃO AVANÇADA POR PADRÕES (REGEX & OPERACIONAIS) ---
+    linhas = [l.strip() for l in texto_bruto.replace('\r\n', '\n').split('\n') if l.strip()]
+    
+    # 1. Estabelecimento (Geralmente a primeira linha relevante)
+    estabelecimento = linhas[0] if linhas else "Desconhecido"
+    
+    # 2. Data (Procura formato DD/MM/AAAA ou DD/MM/AA)
+    data_match = re.search(r'(\d{2}/\d{2}/\d{4})', texto_bruto)
+    if data_match:
+        data_str = data_match.group(1)
+    else:
+        data_match_curta = re.search(r'(\d{2}/\d{2}/\d{2})', texto_bruto)
+        if data_match_curta:
+            d_partes = data_match_curta.group(1).split('/')
+            data_str = f"{d_partes[0]}/{d_partes[1]}/20{d_partes[2]}"
+        else:
+            data_str = datetime.now().strftime("%d/%m/%Y")
+
+    # 2b. Hora da Compra / Emissão
+    hora_match = re.search(r'(\d{2}:\d{2}(?::\d{2})?)', texto_bruto)
+    hora_str = hora_match.group(1) if hora_match else "Não Informada"
+    
+    # 3. Valor Total
+    valor_match = re.search(r'(?:TOTAL|VALOR A PAGAR|PAGAR|R\$\s*)[\s:]*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
+    if not valor_match:
+        valores = re.findall(r'(\d+[\.,]\d{2})', texto_bruto)
+        valor = float(valores[-1].replace(',', '.')) if valores else 0.0
+    else:
+        try:
+            valor = float(valor_match.group(1).replace(',', '.'))
+        except ValueError:
+            valor = 0.0
+
+    # 3b. Valor de Desconto
+    desconto_match = re.search(r'(?:DESCONTO|DESC|ABATIMENTO)[\s:]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
+    desconto_val = float(desconto_match.group(1).replace(',', '.')) if desconto_match else 0.0
+
+    # 3c. Valor de Troco
+    troco_match = re.search(r'(?:TROCO)[\s:]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
+    troco_val = float(troco_match.group(1).replace(',', '.')) if troco_match else 0.0
+
+    # 3d. Impostos / Tributos Aproximados
+    trib_match = re.search(r'(?:TRIB|TRIBUTOS|IMPOSTO|IBPT)[\s\w]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
+    trib_val = float(trib_match.group(1).replace(',', '.')) if trib_match else 0.0
+
+    # 4. CNPJ (Padrão XX.XXX.XXX/XXXX-XX)
+    cnpj_match = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', texto_bruto)
+    cnpj = cnpj_match.group(0) if cnpj_match else ""
+    if cnpj:
+        estabelecimento = f"{estabelecimento} (CNPJ: {cnpj})"
+
+    # 5. Forma de Pagamento & Bandeira do Cartão
+    texto_upper = texto_bruto.upper()
+    pagamento = "Não Informado"
+    if "PIX" in texto_upper:
+        pagamento = "Pix"
+    elif "CREDITO" in texto_upper or "CRÉDITO" in texto_upper:
+        pagamento = "Cartão de Crédito"
+    elif "DEBITO" in texto_upper or "DÉBITO" in texto_upper:
+        pagamento = "Cartão de Débito"
+    elif "DINHEIRO" in texto_upper:
+        pagamento = "Dinheiro"
+
+    bandeira_str = "Não Informada"
+    if "VISA" in texto_upper:
+        bandeira_str = "Visa"
+    elif "MASTERCARD" in texto_upper or "MASTER" in texto_upper:
+        bandeira_str = "Mastercard"
+    elif "ELO" in texto_upper:
+        bandeira_str = "Elo"
+    elif "AMEX" in texto_upper or "AMERICAN" in texto_upper:
+        bandeira_str = "Amex"
+    elif "HIPERCARD" in texto_upper or "HIPER" in texto_upper:
+        bandeira_str = "Hipercard"
+
+    # 6. Tipo de Documento
+    tipo_doc = "Nota Fiscal (PDF)" if is_pdf else "Cupom Fiscal"
+    if "NFC-E" in texto_upper or "NOTA FISCAL" in texto_upper or "DANFE" in texto_upper:
+        tipo_doc = "Nota Fiscal Eletrônica (DANFE)"
+    elif "RECIBO" in texto_upper:
+        tipo_doc = "Recibo"
+
+    return {
+        "status_leitura": "sucesso",
+        "mensagem_erro": None,
+        "data": data_str,
+        "hora": hora_str,
+        "estabelecimento": estabelecimento,
+        "tipo_documento": tipo_doc,
+        "categoria": "Geral",
+        "pagamento": pagamento,
+        "bandeira": bandeira_str,
+        "valor": valor,
+        "desconto": desconto_val,
+        "troco": troco_val,
+        "tributos": trib_val,
+        "itens": []
+    }
 
 def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> bool:
     """
@@ -895,11 +923,11 @@ def gerar_relatorio_mensal(nome_aba: str = None) -> str:
     relatorio += f"\n🔗 [Abrir Planilha no Google Sheets](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID})"
     return relatorio
 
-def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, file_id: str, lock_key: str, observacao: str = "", responsavel: str = "Não Informado"):
+def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, file_id: str, lock_key: str, observacao: str = "", responsavel: str = "Não Informado", is_pdf: bool = False):
     """
     Executado em segundo plano (BackgroundTasks).
     Permite responder HTTP 200 ao Telegram em milissegundos e processar
-    análise de IA e inserção no Sheets de forma assíncrona com medição exata de latência.
+    análise de IA/OCR (fotos ou PDFs) e inserção no Sheets de forma assíncrona.
     """
     t_start = time.time()
     t_download = 0.0
@@ -922,7 +950,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
         "valor": 0.0,
         "observacao": observacao or None,
         "responsavel": responsavel,
-        "origem_foto": f"Telegram ID: {file_id[:10]}...",
+        "origem_foto": f"Telegram PDF: {file_id[:10]}..." if is_pdf else f"Telegram ID: {file_id[:10]}...",
         "tempo_total_sec": 0.0,
         "metricas_tempo": None,
         "erro": None,
@@ -932,7 +960,8 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
 
     try:
         # 1. Envia aviso inicial amigável ao usuário
-        send_telegram_message(chat_id, "🔍 Processando comprovante fiscal com IA (Hugging Face)...", message_id)
+        msg_inicial = "🔍 Processando nota fiscal (PDF) com IA..." if is_pdf else "🔍 Processando comprovante fiscal com IA (Hugging Face)..."
+        send_telegram_message(chat_id, msg_inicial, message_id)
 
         # 2. Download da imagem do Telegram e Análise com Hugging Face (com cronometragem)
         try:
@@ -941,7 +970,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             t_download = time.time() - t_dl_start
 
             t_gemini_start = time.time()
-            extracted_data = analyze_receipt(img_bytes)
+            extracted_data = analyze_receipt(img_bytes, is_pdf=is_pdf)
             t_gemini = time.time() - t_gemini_start
 
             # 3. Verificação do status de leitura (se ilegível, notifica e encerra sem gravar)
@@ -1168,13 +1197,23 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 send_telegram_message(chat_id, relatorio_msg, message_id)
                 return Response(status_code=status.HTTP_200_OK)
 
-        # 3. Se houver foto, agenda em background e responde IMEDIATAMENTE HTTP 200 OK
+        # 3. Trata arquivos anexados (PDFs de notas fiscais) ou fotos de comprovantes
+        file_id = None
+        is_pdf = False
+        legenda_foto = message.get("caption", "").strip()
+
         if "photo" in message:
             largest_photo = message["photo"][-1]
             file_id = largest_photo["file_id"]
-            legenda_foto = message.get("caption", "").strip()
+        elif "document" in message:
+            doc = message["document"]
+            mime_type = doc.get("mime_type", "").lower()
+            file_name = doc.get("file_name", "").lower()
+            if "pdf" in mime_type or file_name.endswith(".pdf"):
+                file_id = doc["file_id"]
+                is_pdf = True
 
-            # Captura o nome de quem enviou a mensagem no Telegram
+        if file_id:
             user_info = message.get("from", {})
             nome_usuario = user_info.get("first_name", "Usuário")
             sobrenome = user_info.get("last_name", "")
@@ -1188,7 +1227,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
             in_progress_locks.add(lock_key)
 
-            # Executa o processamento em background (o Telegram recebe 200 OK em menos de 20ms)
             background_tasks.add_task(
                 process_receipt_photo_task,
                 chat_id=chat_id,
@@ -1197,7 +1235,8 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 file_id=file_id,
                 lock_key=lock_key,
                 observacao=legenda_foto,
-                responsavel=responsavel_completo
+                responsavel=responsavel_completo,
+                is_pdf=is_pdf
             )
 
         return Response(status_code=status.HTTP_200_OK)
