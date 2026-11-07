@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request, Response, BackgroundTasks, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import requests
 import gspread
+from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 from google import genai
 from google.genai import types
@@ -282,16 +283,20 @@ def get_sheets_client():
 
 # Controle de sincronização do histórico do Google Sheets ao religar o servidor
 sheets_history_loaded = False
+last_sheets_load_time = 0.0
 
-def carregar_historico_planilha() -> int:
+def carregar_historico_planilha(force: bool = False) -> int:
     """
     Lê todas as abas da planilha do Google Sheets ao iniciar/religar o servidor ou sob demanda,
-    populando a lista processing_logs para persistir o histórico de lançamentos no painel web.
-    Não altera nenhuma função existente.
+    populando a lista processing_logs com cache de 120s para evitar estouro de cota 429.
     """
-    global sheets_history_loaded
+    global sheets_history_loaded, last_sheets_load_time
     if not SPREADSHEET_ID or not GOOGLE_CREDENTIALS_JSON:
         logger.warning("SPREADSHEET_ID ou GOOGLE_CREDENTIALS_JSON não configurados. Leitura do histórico ignorada.")
+        return 0
+
+    now = time.time()
+    if sheets_history_loaded and not force and (now - last_sheets_load_time < 120):
         return 0
 
     logs_carregados = 0
@@ -307,6 +312,9 @@ def carregar_historico_planilha() -> int:
             nome_aba = ws.title
             try:
                 rows = ws.get_all_values()
+            except APIError as e_api:
+                logger.warning(f"Cota do Google Sheets (429) atada na aba {nome_aba}: {e_api}")
+                break
             except Exception as e_rows:
                 logger.warning(f"Erro ao ler linhas da aba {nome_aba}: {e_rows}")
                 continue
@@ -393,9 +401,10 @@ def carregar_historico_planilha() -> int:
             processing_logs.extend(novos_logs)
 
         sheets_history_loaded = True
+        last_sheets_load_time = time.time()
         logger.info(f"✅ Histórico do Google Sheets carregado com sucesso: {logs_carregados} lançamentos sincronizados.")
     except Exception as e_sheets_load:
-        logger.error(f"⚠️ Erro ao carregar histórico inicial do Google Sheets: {e_sheets_load}")
+        logger.error(f"⚠️ Erro ao carregar histórico do Google Sheets: {e_sheets_load}")
 
     return logs_carregados
 
@@ -554,7 +563,7 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
     estab_novo = str(dados_extraidos.get("estabelecimento", "")).strip().lower()
     valor_novo = float(dados_extraidos.get("valor", 0.0))
 
-    # 1. Checagem em memória no histórico recente de logs (evita concorrência e gravações simultâneas)
+    # 1. Checagem em memória no histórico recente de logs (evita concorrência e economiza cota da API)
     for log in processing_logs[:limite_registros]:
         st = log.get("status_sheets", "")
         if st in ("Enviado com Sucesso", "Gravando na Planilha...", "Processando"):
@@ -574,7 +583,7 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
                 logger.info(f"Duplicidade detectada no cache local em memória: {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
                 return True
 
-    # 2. Checagem direta na planilha do Google Sheets (na aba mensal correspondente)
+    # 2. Checagem opcional na planilha do Google Sheets com proteção contra cota 429
     if SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON:
         try:
             gc = get_sheets_client()
@@ -586,14 +595,11 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
                 worksheet = sh.get_worksheet(0)
             
             todas_linhas = worksheet.get_all_values()
-            
             if len(todas_linhas) <= 1:
                 return False
             
             ultimas_linhas = todas_linhas[-limite_registros:]
-            
             for linha in ultimas_linhas:
-                # Ordem das colunas: [Data, Estabelecimento, Documento, Categoria, Pagamento, Valor, Comprovante]
                 if len(linha) >= 6:
                     data_existente = str(linha[0]).strip()
                     estab_existente = str(linha[1]).strip().lower()
@@ -613,6 +619,8 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
                         abs(valor_novo - valor_existente) < 0.01):
                         logger.info(f"Duplicidade detectada no Google Sheets ({nome_aba}): {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
                         return True
+        except APIError as e_api:
+            logger.warning(f"Cota de leitura do Google Sheets (429) atingida na duplicidade. Ignorando consulta remota: {e_api}")
         except Exception as e_dup:
             logger.warning(f"Aviso ao consultar duplicidade no Google Sheets: {e_dup}")
             
@@ -642,8 +650,7 @@ def obter_nome_aba(data_str: str) -> str:
 def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", observacao: str = "", responsavel: str = "Não Informado") -> tuple[int, str]:
     """
     Grava o lançamento na aba mensal correspondente (ex: Novembro_2026),
-    incluindo a coluna Responsável e a coluna de Observação com a legenda enviada no Telegram.
-    Se a aba não existir, cria automaticamente com cabeçalho formatado.
+    incluindo mecanismo de retry com backoff exponencial contra erros 429 de cota do Google.
     """
     if not SPREADSHEET_ID:
         raise ValueError("SPREADSHEET_ID não configurada nas variáveis de ambiente.")
@@ -696,26 +703,35 @@ def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", o
         str(data.get("categoria", "Não Informado")),
         str(data.get("pagamento", "Não Informado")),
         float(data.get("valor", 0.0)),
-        str(responsavel or "Não Informado"),  # 7ª coluna: Responsável (quem enviou a foto)
-        formula_link,                         # 8ª coluna: Comprovante
-        str(observacao or "")                 # 9ª coluna: Observação (legenda da foto no Telegram)
+        str(responsavel or "Não Informado"),
+        formula_link,
+        str(observacao or "")
     ]
 
-    try:
-        worksheet.append_row(row, value_input_option='USER_ENTERED')
-    except Exception as e_user_entered:
-        logger.warning(f"Tentativa com USER_ENTERED falhou ({e_user_entered}). Tentando formato compatível...")
-        if url_direta_imagem.startswith("http"):
-            row[7] = f'=HYPERLINK("{url_direta_imagem}", "Ver Imagem")'
-            try:
-                worksheet.append_row(row, value_input_option='USER_ENTERED')
-            except Exception:
-                row[7] = url_direta_imagem
-                worksheet.append_row(row)
-        else:
+    # Tentativas com backoff automático contra erro 429
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            worksheet.append_row(row, value_input_option='USER_ENTERED')
+            break
+        except APIError as e_api:
+            if "429" in str(e_api) or "Quota exceeded" in str(e_api):
+                logger.warning(f"Cota do Google Sheets atingida (429). Tentativa {attempt}/{max_retries}. Aguardando {attempt * 2}s...")
+                if attempt < max_retries:
+                    time.sleep(attempt * 2)
+                else:
+                    raise e_api
+            else:
+                raise e_api
+        except Exception as e_user_entered:
+            logger.warning(f"Tentativa alternativa de inserção no Sheets ({e_user_entered})...")
+            if url_direta_imagem.startswith("http"):
+                row[7] = f'=HYPERLINK("{url_direta_imagem}", "Ver Imagem")'
             worksheet.append_row(row)
+            break
 
-    total_linhas = len(worksheet.get_all_values())
+    # Retorna contador estimado em memória sem fazer nova chamada de leitura de todas as linhas da planilha
+    total_linhas = len(processing_logs) + 1
     return total_linhas, nome_aba
 
 # Aliases para compatibilidade total
