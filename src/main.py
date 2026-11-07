@@ -433,8 +433,8 @@ def download_telegram_file(file_id: str) -> tuple[bytes, str]:
 
 def analyze_receipt(img_bytes: bytes) -> dict:
     """
-    Envia a imagem para a API do OCR.space e extrai os campos principais 
-    utilizando Regex no texto retornado.
+    Envia a imagem para o OCR.space e realiza a extração avançada 
+    de múltiplos campos usando Regex e análise de palavras-chave.
     """
     api_key = os.getenv("OCR_SPACE_API_KEY", "helloworld")
     url = "https://api.ocr.space/parse/image"
@@ -442,7 +442,7 @@ def analyze_receipt(img_bytes: bytes) -> dict:
     payload = {
         'isOverlayRequired': False,
         'apikey': api_key,
-        'language': 'por', # Define o idioma português para melhorar o reconhecimento
+        'language': 'por',
     }
     
     files = {
@@ -450,73 +450,100 @@ def analyze_receipt(img_bytes: bytes) -> dict:
     }
     
     try:
-        logger.info("Enviando imagem para a API OCR.space...")
+        logger.info("Enviando imagem para o OCR.space para análise avançada...")
         response = requests.post(url, data=payload, files=files, timeout=30)
         resultado = response.json()
         
         if resultado.get("IsErroredOnProcessing"):
             erro_msg = resultado.get("ErrorMessage", ["Erro desconhecido"])[0]
             logger.error(f"Erro no OCR.space: {erro_msg}")
-            return {
-                "status_leitura": "ilegivel",
-                "mensagem_erro": f"Erro OCR: {erro_msg}"
-            }
+            return {"status_leitura": "ilegivel", "mensagem_erro": f"Erro OCR: {erro_msg}"}
             
         parsed_results = resultado.get("ParsedResults", [])
         if not parsed_results:
-            return {
-                "status_leitura": "ilegivel",
-                "mensagem_erro": "Nenhum texto foi detectado na imagem."
-            }
+            return {"status_leitura": "ilegivel", "mensagem_erro": "Nenhum texto detectado na imagem."}
             
         texto_bruto = parsed_results[0].get("ParsedText", "")
-        
         if not texto_bruto.strip():
-            return {
-                "status_leitura": "ilegivel",
-                "mensagem_erro": "A imagem está muito ilegível ou sem texto legível."
-            }
+            return {"status_leitura": "ilegivel", "mensagem_erro": "Imagem ilegível ou sem texto."}
 
-        logger.info(f"Texto extraído via OCR.space com sucesso: {texto_bruto[:150]}...")
+        logger.info(f"Texto bruto capturado via OCR.space:\n{texto_bruto[:200]}...")
 
-        # --- PARSER EM PYTHON (Extração por Regex) ---
-        
-        # 1. Procura por valores monetários (ex: R$ 45,90 ou 45.90)
-        valor_match = re.search(r'(?:R\$\s*)?(\d+[\.,]\d{2})', texto_bruto)
-        valor = float(valor_match.group(1).replace(',', '.')) if valor_match else 0.0
-        
-        # 2. Procura por datas no formato DD/MM/AAAA
-        data_match = re.search(r'(\d{2}/\d{2}/\d{4})', texto_bruto)
-        data_str = data_match.group(1) if data_match else datetime.now().strftime("%d/%m/%Y")
-        
-        # 3. Estabelecimento (pega a primeira linha relevante do cupom como nome provável)
+        # Limpa as linhas do texto
         linhas = [l.strip() for l in texto_bruto.replace('\r\n', '\n').split('\n') if l.strip()]
-        estabelecimento = linhas[0] if linhas else "Estabelecimento Desconhecido"
+        
+        # --- EXTRAÇÃO AVANÇADA POR PADRÕES (REGEX) ---
+        
+        # 1. Estabelecimento (Geralmente a primeira linha relevante)
+        estabelecimento = linhas[0] if linhas else "Desconhecido"
+        
+        # 2. Data (Procura formato DD/MM/AAAA ou DD/MM/AA)
+        data_match = re.search(r'(\d{2}/\d{2}/\d{4})', texto_bruto)
+        if data_match:
+            data_str = data_match.group(1)
+        else:
+            data_match_curta = re.search(r'(\d{2}/\d{2}/\d{2})', texto_bruto)
+            if data_match_curta:
+                d_partes = data_match_curta.group(1).split('/')
+                data_str = f"{d_partes[0]}/{d_partes[1]}/20{d_partes[2]}"
+            else:
+                data_str = datetime.now().strftime("%d/%m/%Y")
+        
+        # 3. Valor Total (Procura por termos como 'TOTAL', 'VALOR A PAGAR' ou pega o último valor do cupom)
+        valor_match = re.search(r'(?:TOTAL|VALOR|PAGAR|R\$\s*)[\s:]*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
+        if not valor_match:
+            # Fallback: pega o último valor numérico monetário encontrado no texto
+            valores = re.findall(r'(\d+[\.,]\d{2})', texto_bruto)
+            valor = float(valores[-1].replace(',', '.')) if valores else 0.0
+        else:
+            try:
+                valor = float(valor_match.group(1).replace(',', '.'))
+            except ValueError:
+                valor = 0.0
+
+        # 4. CNPJ (Padrão XX.XXX.XXX/XXXX-XX)
+        cnpj_match = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', texto_bruto)
+        cnpj = cnpj_match.group(0) if cnpj_match else ""
+        if cnpj:
+            estabelecimento = f"{estabelecimento} (CNPJ: {cnpj})"
+
+        # 5. Forma de Pagamento (Varre o texto por termos comuns)
+        texto_upper = texto_bruto.upper()
+        pagamento = "Não Informado"
+        if "PIX" in texto_upper:
+            pagamento = "Pix"
+        elif "CREDITO" in texto_upper or "CRÉDITO" in texto_upper:
+            pagamento = "Cartão de Crédito"
+        elif "DEBITO" in texto_upper or "DÉBITO" in texto_upper:
+            pagamento = "Cartão de Débito"
+        elif "DINHEIRO" in texto_upper:
+            pagamento = "Dinheiro"
+
+        # 6. Tipo de Documento
+        tipo_doc = "Cupom Fiscal"
+        if "NFC-E" in texto_upper or "NOTA FISCAL" in texto_upper:
+            tipo_doc = "Nota Fiscal Eletrônica"
+        elif "RECIBO" in texto_upper:
+            tipo_doc = "Recibo"
 
         return {
             "status_leitura": "sucesso",
             "mensagem_erro": None,
             "data": data_str,
             "estabelecimento": estabelecimento,
-            "tipo_documento": "Cupom Fiscal",
+            "tipo_documento": tipo_doc,
             "categoria": "Geral",
-            "pagamento": "Não Informado",
+            "pagamento": pagamento,
             "valor": valor,
             "itens": []
         }
 
     except requests.exceptions.Timeout:
         logger.error("Timeout ao conectar com o OCR.space.")
-        return {
-            "status_leitura": "ilegivel",
-            "mensagem_erro": "O serviço de OCR demorou muito para responder."
-        }
+        return {"status_leitura": "ilegivel", "mensagem_erro": "O serviço de OCR demorou muito para responder."}
     except Exception as e:
-        logger.error(f"Erro inesperado no OCR.space: {str(e)}")
-        return {
-            "status_leitura": "ilegivel",
-            "mensagem_erro": f"Erro ao processar OCR: {str(e)}"
-        }
+        logger.error(f"Erro no processamento do OCR: {str(e)}")
+        return {"status_leitura": "ilegivel", "mensagem_erro": f"Erro interno ao processar OCR: {str(e)}"}
 
 def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> bool:
     """
