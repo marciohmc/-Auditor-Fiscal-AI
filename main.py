@@ -331,34 +331,54 @@ def carregar_historico_planilha(force: bool = False) -> int:
                 if log_id in existing_ids:
                     continue
 
-                data_comprovante = str(linha[0]).strip() if len(linha) > 0 else ""
-                estabelecimento = str(linha[1]).strip() if len(linha) > 1 else "Não Informado"
-                tipo_doc = str(linha[2]).strip() if len(linha) > 2 else "Não Informado"
-                categoria = str(linha[3]).strip() if len(linha) > 3 else "Outros"
-                pagamento = str(linha[4]).strip() if len(linha) > 4 else "Não Informado"
-
-                # Parse de Valor
-                valor_float = 0.0
-                if len(linha) > 5:
+                if len(linha) >= 14:
+                    data_comprovante = str(linha[0]).strip()
+                    hora_comprovante = str(linha[1]).strip()
+                    estabelecimento = str(linha[2]).strip()
+                    tipo_doc = str(linha[3]).strip()
+                    categoria = str(linha[4]).strip()
+                    pagamento = str(linha[5]).strip()
+                    bandeira = str(linha[6]).strip()
                     try:
-                        val_str = (
-                            str(linha[5])
-                            .replace("R$", "")
-                            .replace(" ", "")
-                            .replace(",", ".")
-                            .strip()
-                        )
-                        valor_float = float(val_str)
+                        valor_float = float(str(linha[7]).replace("R$", "").replace(" ", "").replace(",", ".").strip())
                     except ValueError:
                         valor_float = 0.0
+                    try:
+                        desconto_float = float(str(linha[8]).replace("R$", "").replace(" ", "").replace(",", ".").strip())
+                    except ValueError:
+                        desconto_float = 0.0
+                    try:
+                        troco_float = float(str(linha[9]).replace("R$", "").replace(" ", "").replace(",", ".").strip())
+                    except ValueError:
+                        troco_float = 0.0
+                    try:
+                        tributos_float = float(str(linha[10]).replace("R$", "").replace(" ", "").replace(",", ".").strip())
+                    except ValueError:
+                        tributos_float = 0.0
+                    responsavel = str(linha[11]).strip() if str(linha[11]).strip() else "Não Informado"
+                    comprovante_raw = str(linha[12]).strip()
+                    observacao = str(linha[13]).strip()
+                else:
+                    data_comprovante = str(linha[0]).strip() if len(linha) > 0 else ""
+                    hora_comprovante = "Não Informada"
+                    estabelecimento = str(linha[1]).strip() if len(linha) > 1 else "Não Informado"
+                    tipo_doc = str(linha[2]).strip() if len(linha) > 2 else "Não Informado"
+                    categoria = str(linha[3]).strip() if len(linha) > 3 else "Outros"
+                    pagamento = str(linha[4]).strip() if len(linha) > 4 else "Não Informado"
+                    bandeira = "Não Informada"
+                    valor_float = 0.0
+                    if len(linha) > 5:
+                        try:
+                            valor_float = float(str(linha[5]).replace("R$", "").replace(" ", "").replace(",", ".").strip())
+                        except ValueError:
+                            valor_float = 0.0
+                    desconto_float = 0.0
+                    troco_float = 0.0
+                    tributos_float = 0.0
+                    responsavel = str(linha[6]).strip() if len(linha) > 6 and str(linha[6]).strip() else "Não Informado"
+                    comprovante_raw = str(linha[7]).strip() if len(linha) > 7 else ""
+                    observacao = str(linha[8]).strip() if len(linha) > 8 else ""
 
-                # Parse de Responsável
-                responsavel = "Não Informado"
-                if len(linha) > 6 and str(linha[6]).strip():
-                    responsavel = str(linha[6]).strip()
-
-                # Parse de Comprovante (Fórmula HYPERLINK ou URL direta)
-                comprovante_raw = str(linha[7]).strip() if len(linha) > 7 else ""
                 link_url = ""
                 if 'HYPERLINK("' in comprovante_raw:
                     try:
@@ -368,12 +388,9 @@ def carregar_historico_planilha(force: bool = False) -> int:
                 elif comprovante_raw.startswith("http"):
                     link_url = comprovante_raw
 
-                # Parse de Observação / Legenda
-                observacao = str(linha[8]).strip() if len(linha) > 8 else ""
-
                 log_entry = {
                     "id": log_id,
-                    "timestamp": data_comprovante or datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                    "timestamp": f"{data_comprovante} {hora_comprovante}".strip() if hora_comprovante != "Não Informada" else (data_comprovante or datetime.now().strftime("%d/%m/%Y %H:%M:%S")),
                     "chat_id": "Planilha Google",
                     "username": responsavel,
                     "status_gemini": "Sucesso",
@@ -382,8 +399,13 @@ def carregar_historico_planilha(force: bool = False) -> int:
                     "tipo_documento": tipo_doc or "Não Informado",
                     "categoria": categoria or "Outros",
                     "pagamento": pagamento or "Não Informado",
+                    "bandeira": bandeira,
                     "valor": valor_float,
+                    "desconto": desconto_float,
+                    "troco": troco_float,
+                    "tributos": tributos_float,
                     "data_comprovante": data_comprovante,
+                    "hora_comprovante": hora_comprovante,
                     "observacao": observacao or None,
                     "responsavel": responsavel,
                     "origem_foto": "Sincronizado do Google Sheets",
@@ -443,7 +465,7 @@ def download_telegram_file(file_id: str) -> tuple[bytes, str]:
 def analyze_receipt(img_bytes: bytes) -> dict:
     """
     Envia a imagem para o OCR.space e realiza a extração avançada 
-    de múltiplos campos usando Regex e análise de palavras-chave.
+    de múltiplos campos incluindo Detalhes Financeiros & Operacionais (Hora, Desconto, Troco, Bandeira, Tributos).
     """
     api_key = os.getenv("OCR_SPACE_API_KEY", "helloworld")
     url = "https://api.ocr.space/parse/image"
@@ -481,7 +503,7 @@ def analyze_receipt(img_bytes: bytes) -> dict:
         # Limpa as linhas do texto
         linhas = [l.strip() for l in texto_bruto.replace('\r\n', '\n').split('\n') if l.strip()]
         
-        # --- EXTRAÇÃO AVANÇADA POR PADRÕES (REGEX) ---
+        # --- EXTRAÇÃO AVANÇADA POR PADRÕES (REGEX & OPERACIONAIS) ---
         
         # 1. Estabelecimento (Geralmente a primeira linha relevante)
         estabelecimento = linhas[0] if linhas else "Desconhecido"
@@ -497,11 +519,14 @@ def analyze_receipt(img_bytes: bytes) -> dict:
                 data_str = f"{d_partes[0]}/{d_partes[1]}/20{d_partes[2]}"
             else:
                 data_str = datetime.now().strftime("%d/%m/%Y")
+
+        # 2b. Hora da Compra / Emissão
+        hora_match = re.search(r'(\d{2}:\d{2}(?::\d{2})?)', texto_bruto)
+        hora_str = hora_match.group(1) if hora_match else "Não Informada"
         
         # 3. Valor Total (Procura por termos como 'TOTAL', 'VALOR A PAGAR' ou pega o último valor do cupom)
-        valor_match = re.search(r'(?:TOTAL|VALOR|PAGAR|R\$\s*)[\s:]*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
+        valor_match = re.search(r'(?:TOTAL|VALOR A PAGAR|PAGAR|R\$\s*)[\s:]*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
         if not valor_match:
-            # Fallback: pega o último valor numérico monetário encontrado no texto
             valores = re.findall(r'(\d+[\.,]\d{2})', texto_bruto)
             valor = float(valores[-1].replace(',', '.')) if valores else 0.0
         else:
@@ -510,13 +535,25 @@ def analyze_receipt(img_bytes: bytes) -> dict:
             except ValueError:
                 valor = 0.0
 
+        # 3b. Valor de Desconto
+        desconto_match = re.search(r'(?:DESCONTO|DESC|ABATIMENTO)[\s:]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
+        desconto_val = float(desconto_match.group(1).replace(',', '.')) if desconto_match else 0.0
+
+        # 3c. Valor de Troco
+        troco_match = re.search(r'(?:TROCO)[\s:]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
+        troco_val = float(troco_match.group(1).replace(',', '.')) if troco_match else 0.0
+
+        # 3d. Impostos / Tributos Aproximados
+        trib_match = re.search(r'(?:TRIB|TRIBUTOS|IMPOSTO|IBPT)[\s\w]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
+        trib_val = float(trib_match.group(1).replace(',', '.')) if trib_match else 0.0
+
         # 4. CNPJ (Padrão XX.XXX.XXX/XXXX-XX)
         cnpj_match = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', texto_bruto)
         cnpj = cnpj_match.group(0) if cnpj_match else ""
         if cnpj:
             estabelecimento = f"{estabelecimento} (CNPJ: {cnpj})"
 
-        # 5. Forma de Pagamento (Varre o texto por termos comuns)
+        # 5. Forma de Pagamento & Bandeira do Cartão
         texto_upper = texto_bruto.upper()
         pagamento = "Não Informado"
         if "PIX" in texto_upper:
@@ -527,6 +564,18 @@ def analyze_receipt(img_bytes: bytes) -> dict:
             pagamento = "Cartão de Débito"
         elif "DINHEIRO" in texto_upper:
             pagamento = "Dinheiro"
+
+        bandeira_str = "Não Informada"
+        if "VISA" in texto_upper:
+            bandeira_str = "Visa"
+        elif "MASTERCARD" in texto_upper or "MASTER" in texto_upper:
+            bandeira_str = "Mastercard"
+        elif "ELO" in texto_upper:
+            bandeira_str = "Elo"
+        elif "AMEX" in texto_upper or "AMERICAN" in texto_upper:
+            bandeira_str = "Amex"
+        elif "HIPERCARD" in texto_upper or "HIPER" in texto_upper:
+            bandeira_str = "Hipercard"
 
         # 6. Tipo de Documento
         tipo_doc = "Cupom Fiscal"
@@ -539,11 +588,16 @@ def analyze_receipt(img_bytes: bytes) -> dict:
             "status_leitura": "sucesso",
             "mensagem_erro": None,
             "data": data_str,
+            "hora": hora_str,
             "estabelecimento": estabelecimento,
             "tipo_documento": tipo_doc,
             "categoria": "Geral",
             "pagamento": pagamento,
+            "bandeira": bandeira_str,
             "valor": valor,
+            "desconto": desconto_val,
+            "troco": troco_val,
+            "tributos": trib_val,
             "itens": []
         }
 
@@ -666,8 +720,12 @@ def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", o
         worksheet = sh.worksheet(nome_aba)
     except Exception:
         try:
-            worksheet = sh.add_worksheet(title=nome_aba, rows=100, cols=10)
-            cabecalho = ["Data", "Estabelecimento", "Tipo Documento", "Categoria", "Forma Pagamento", "Valor (R$)", "Responsável", "Comprovante", "Observação"]
+            worksheet = sh.add_worksheet(title=nome_aba, rows=100, cols=15)
+            cabecalho = [
+                "Data", "Hora", "Estabelecimento", "Tipo Documento", "Categoria", 
+                "Forma Pagamento", "Bandeira", "Valor (R$)", "Desconto (R$)", "Troco (R$)", 
+                "Tributos (R$)", "Responsável", "Comprovante", "Observação"
+            ]
             worksheet.append_row(cabecalho, value_input_option='USER_ENTERED')
             logger.info(f"Nova aba criada com sucesso: {nome_aba}")
         except Exception as e_add:
@@ -698,11 +756,16 @@ def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", o
 
     row = [
         str(data.get("data", "Não Informado")),
+        str(data.get("hora", "Não Informada")),
         str(data.get("estabelecimento", "Não Informado")),
         str(data.get("tipo_documento", "Não Informado")),
         str(data.get("categoria", "Não Informado")),
         str(data.get("pagamento", "Não Informado")),
+        str(data.get("bandeira", "Não Informada")),
         float(data.get("valor", 0.0)),
+        float(data.get("desconto", 0.0)),
+        float(data.get("troco", 0.0)),
+        float(data.get("tributos", 0.0)),
         str(responsavel or "Não Informado"),
         formula_link,
         str(observacao or "")
@@ -1009,16 +1072,31 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
                 return
 
         # 6. Mensagem de sucesso limpa no grupo do Telegram
+        data_hora_str = extracted_data.get('data', 'Não Informado')
+        if extracted_data.get('hora') and extracted_data.get('hora') != 'Não Informada':
+            data_hora_str += f" às {extracted_data.get('hora')}"
+
+        pagamento_str = extracted_data.get('pagamento', 'Não Informado')
+        if extracted_data.get('bandeira') and extracted_data.get('bandeira') != 'Não Informada':
+            pagamento_str += f" ({extracted_data.get('bandeira')})"
+
         success_msg = (
             "✅ *Lançamento Registrado com Sucesso!*\n\n"
             f"• *Responsável:* {responsavel}\n"
-            f"• *Data:* {extracted_data.get('data')}\n"
+            f"• *Data/Hora:* {data_hora_str}\n"
             f"• *Estabelecimento:* {extracted_data.get('estabelecimento')}\n"
             f"• *Categoria:* {extracted_data.get('categoria')}\n"
-            f"• *Pagamento:* {extracted_data.get('pagamento')}\n"
-            f"• *Valor:* R$ {float(extracted_data.get('valor', 0)):.2f}\n"
-            f"• *Aba Mensal:* `{nome_aba}`"
+            f"• *Pagamento:* {pagamento_str}\n"
+            f"• *Valor Total:* R$ {float(extracted_data.get('valor', 0)):.2f}"
         )
+        if float(extracted_data.get("desconto", 0)) > 0:
+            success_msg += f"\n• *Desconto:* R$ {float(extracted_data.get('desconto', 0)):.2f}"
+        if float(extracted_data.get("troco", 0)) > 0:
+            success_msg += f"\n• *Troco:* R$ {float(extracted_data.get('troco', 0)):.2f}"
+        if float(extracted_data.get("tributos", 0)) > 0:
+            success_msg += f"\n• *Tributos IBPT:* R$ {float(extracted_data.get('tributos', 0)):.2f}"
+
+        success_msg += f"\n• *Aba Mensal:* `{nome_aba}`"
         if observacao:
             success_msg += f"\n• *Obs:* {observacao}"
         success_msg += f"\n\n⚡ *Processado em {t_total:.1f}s* | 📊 *Gravado no Google Sheets!*"
