@@ -470,6 +470,97 @@ def download_telegram_file(file_id: str) -> tuple[bytes, str]:
     file_res = requests.get(download_url, timeout=30)
     return file_res.content, download_url
 
+MESES_TEXTO_MAP = {
+    'jan': 1, 'janeiro': 1,
+    'fev': 2, 'fevereiro': 2,
+    'mar': 3, 'marco': 3, 'março': 3,
+    'abr': 4, 'abril': 4,
+    'mai': 5, 'maio': 5,
+    'jun': 6, 'junho': 6,
+    'jul': 7, 'julho': 7,
+    'ago': 8, 'agosto': 8,
+    'set': 9, 'setembro': 9,
+    'out': 10, 'outubro': 10,
+    'nov': 11, 'novembro': 11,
+    'dez': 12, 'dezembro': 12
+}
+
+def extrair_data_e_hora_documento(texto: str) -> tuple[str, str]:
+    """
+    Extrai data e hora reais do documento fiscal/comprovante com alta precisão,
+    suportando formatos numéricos, textuais (ex: 05 NOV 2026), ISO (2026-11-05),
+    espaços do OCR e âncoras contextuais bancárias.
+    Retorna (data_dd_mm_aaaa, hora_hh_mm).
+    """
+    data_encontrada = ""
+    hora_encontrada = "Não Informada"
+
+    # 1. Busca por Hora (HH:MM:SS ou HH:MM)
+    m_hora = re.search(r'\b([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?\b', texto)
+    if m_hora:
+        hora_encontrada = m_hora.group(0).strip()
+
+    # 2. Âncoras contextuais que antecedem a data do documento
+    ancoras_data = [
+        r'(?:DATA\s+DO\s+PAGAMENTO|DATA\s+DA\s+TRANSFER[EÊ]NCIA|DATA\s+DA\s+COMPRA|DATA\s+DE\s+EMISS[ÃA]O|EMISS[ÃA]O|DATA/HORA|DATA\s+EMISS[ÃA]O|PAGO\s+EM|REALIZADO\s+EM|TRANSFERIDO\s+EM|DATA)[\s:]*([^\n\r]{3,40})'
+    ]
+    
+    trechos_para_analise = []
+    for anc in ancoras_data:
+        for m in re.finditer(anc, texto, re.IGNORECASE):
+            trechos_para_analise.append(m.group(1))
+    
+    trechos_para_analise.append(texto)
+
+    def parse_data_candidata(candidato: str) -> str:
+        # A. Formato Numérico DD/MM/AAAA ou DD.MM.AAAA ou DD-MM-AAAA (com tolerância a espaços de OCR)
+        m_num = re.search(r'\b(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(20\d{2})\b', candidato)
+        if m_num:
+            dia, mes, ano = int(m_num.group(1)), int(m_num.group(2)), int(m_num.group(3))
+            if 1 <= dia <= 31 and 1 <= mes <= 12 and 2020 <= ano <= 2035:
+                return f"{dia:02d}/{mes:02d}/{ano}"
+
+        # B. Formato Textual: "05 NOV 2026", "05 de novembro de 2026", "5/nov/2026"
+        m_txt = re.search(r'\b(\d{1,2})\s*(?:de\s+|[/.-])?([A-Za-zÀ-ÖØ-öø-ÿ]{3,10})\s*(?:de\s+|[/.-])?(20\d{2})\b', candidato, re.IGNORECASE)
+        if m_txt:
+            dia = int(m_txt.group(1))
+            mes_txt = m_txt.group(2).lower()
+            ano = int(m_txt.group(3))
+            mes_num = MESES_TEXTO_MAP.get(mes_txt[:3]) or MESES_TEXTO_MAP.get(mes_txt)
+            if mes_num and 1 <= dia <= 31 and 2020 <= ano <= 2035:
+                return f"{dia:02d}/{mes_num:02d}/{ano}"
+
+        # C. Formato ISO: YYYY-MM-DD ou YYYY/MM/DD
+        m_iso = re.search(r'\b(20\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})\b', candidato)
+        if m_iso:
+            ano, mes, dia = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+            if 1 <= dia <= 31 and 1 <= mes <= 12 and 2020 <= ano <= 2035:
+                return f"{dia:02d}/{mes:02d}/{ano}"
+
+        # D. Formato Numérico Curto: DD/MM/AA
+        m_curto = re.search(r'\b(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{2})\b', candidato)
+        if m_curto:
+            dia, mes, ano_curto = int(m_curto.group(1)), int(m_curto.group(2)), int(m_curto.group(3))
+            ano = 2000 + ano_curto
+            if 1 <= dia <= 31 and 1 <= mes <= 12 and 2020 <= ano <= 2035:
+                return f"{dia:02d}/{mes:02d}/{ano}"
+
+        return ""
+
+    for trecho in trechos_para_analise:
+        res_data = parse_data_candidata(trecho)
+        if res_data:
+            data_encontrada = res_data
+            break
+
+    # Se realmente nenhuma data for identificada no comprovante (imagem cortada/sem cabeçalho)
+    if not data_encontrada:
+        agora = datetime.now()
+        data_encontrada = agora.strftime("%d/%m/%Y")
+        logger.warning(f"Data não detectada no texto do documento. Usando data atual como contingência: {data_encontrada}")
+
+    return data_encontrada, hora_encontrada
+
 def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
     """
     Analisa comprovante (foto ou PDF de nota fiscal).
@@ -645,21 +736,8 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
         if cnpj and "CNPJ:" not in estabelecimento:
             estabelecimento = f"{estabelecimento} (CNPJ: {cnpj})"
     
-    # 2. Data (Procura formato DD/MM/AAAA ou DD/MM/AA)
-    data_match = re.search(r'(\d{2}/\d{2}/\d{4})', texto_bruto)
-    if data_match:
-        data_str = data_match.group(1)
-    else:
-        data_match_curta = re.search(r'(\d{2}/\d{2}/\d{2})', texto_bruto)
-        if data_match_curta:
-            d_partes = data_match_curta.group(1).split('/')
-            data_str = f"{d_partes[0]}/{d_partes[1]}/20{d_partes[2]}"
-        else:
-            data_str = datetime.now().strftime("%d/%m/%Y")
-
-    # 2b. Hora da Compra / Emissão
-    hora_match = re.search(r'(\d{2}:\d{2}(?::\d{2})?)', texto_bruto)
-    hora_str = hora_match.group(1) if hora_match else "Não Informada"
+    # 2. Data e Hora Reais do Documento (Extração inteligente resiliente a múltiplos formatos)
+    data_str, hora_str = extrair_data_e_hora_documento(texto_bruto)
     
     # 3. Valor Total
     valor_match = re.search(r'(?:TOTAL|VALOR A PAGAR|PAGAR|VALOR PAGO|VALOR DA TRANSFER[EÊ]NCIA|VALOR|R\$\s*)[\s:]*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
@@ -741,7 +819,7 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
         "itens": []
     }
 
-def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> bool:
+def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 50) -> bool:
     """
     Verifica se os dados extraídos já existem nos registros recentes ou na planilha do Google Sheets.
     Retorna True se for duplicado e False se for um lançamento novo.
@@ -750,13 +828,18 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
     estab_novo = str(dados_extraidos.get("estabelecimento", "")).strip().lower()
     valor_novo = float(dados_extraidos.get("valor", 0.0))
 
+    # Limpeza básica do estabelecimento para comparação sem ruído de CPF/CNPJ
+    estab_novo_clean = re.sub(r'\(.*?\)', '', estab_novo).strip()
+
     # 1. Checagem em memória no histórico recente de logs (evita concorrência e economiza cota da API)
     for log in processing_logs[:limite_registros]:
         st = log.get("status_sheets", "")
         if st in ("Enviado com Sucesso", "Gravando na Planilha...", "Processando"):
             e_antigo = str(log.get("estabelecimento", "")).strip().lower()
+            e_antigo_clean = re.sub(r'\(.*?\)', '', e_antigo).strip()
             v_antigo = float(log.get("valor", 0.0))
-            d_antiga = str(log.get("data_comprovante", "")).strip()
+            d_antiga = str(log.get("data_comprovante", "") or log.get("data", "")).strip()
+
             if not d_antiga and log.get("detalhes"):
                 try:
                     det_json = json.loads(log["detalhes"].split(" | ")[0])
@@ -764,13 +847,14 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
                 except Exception:
                     pass
 
-            if (data_nova == d_antiga and 
-                estab_novo == e_antigo and 
-                abs(valor_novo - v_antigo) < 0.01):
-                logger.info(f"Duplicidade detectada no cache local em memória: {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
-                return True
+            if data_nova and d_antiga == data_nova and abs(valor_novo - v_antigo) < 0.01:
+                if (estab_novo_clean == e_antigo_clean or 
+                    estab_novo_clean in e_antigo_clean or 
+                    e_antigo_clean in estab_novo_clean):
+                    logger.info(f"Duplicidade detectada no cache local em memória: {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
+                    return True
 
-    # 2. Checagem opcional na planilha do Google Sheets com proteção contra cota 429
+    # 2. Checagem na planilha do Google Sheets com mapeamento dinâmico de cabeçalho
     if SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON:
         try:
             gc = get_sheets_client()
@@ -784,15 +868,31 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
             todas_linhas = worksheet.get_all_values()
             if len(todas_linhas) <= 1:
                 return False
-            
-            ultimas_linhas = todas_linhas[-limite_registros:]
-            for linha in ultimas_linhas:
-                if len(linha) >= 6:
-                    data_existente = str(linha[0]).strip()
-                    estab_existente = str(linha[1]).strip().lower()
+
+            # Identificação dinâmica das colunas pelo cabeçalho
+            cabecalho = [str(c).strip().lower() for c in todas_linhas[0]]
+            idx_data = 0
+            idx_estab = 2 if len(cabecalho) >= 14 else 1
+            idx_valor = 7 if len(cabecalho) >= 14 else 5
+
+            for i, col_name in enumerate(cabecalho):
+                if "data" in col_name:
+                    idx_data = i
+                elif "estab" in col_name:
+                    idx_estab = i
+                elif "valor" in col_name and ("total" in col_name or "r$" in col_name or idx_valor == 7):
+                    idx_valor = i
+
+            ultimas_linhas = todas_linhas[1:]
+            for linha in ultimas_linhas[-limite_registros:]:
+                if len(linha) > max(idx_data, idx_estab, idx_valor):
+                    data_existente = str(linha[idx_data]).strip()
+                    estab_existente = str(linha[idx_estab]).strip().lower()
+                    estab_exist_clean = re.sub(r'\(.*?\)', '', estab_existente).strip()
+
                     try:
                         valor_existente = float(
-                            str(linha[5])
+                            str(linha[idx_valor])
                             .replace("R$", "")
                             .replace(" ", "")
                             .replace(",", ".")
@@ -800,12 +900,13 @@ def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 20) -> 
                         )
                     except ValueError:
                         valor_existente = 0.0
-                    
-                    if (data_nova == data_existente and 
-                        estab_novo == estab_existente and 
-                        abs(valor_novo - valor_existente) < 0.01):
-                        logger.info(f"Duplicidade detectada no Google Sheets ({nome_aba}): {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
-                        return True
+
+                    if data_nova and data_nova == data_existente and abs(valor_novo - valor_existente) < 0.01:
+                        if (estab_novo_clean == estab_exist_clean or 
+                            estab_novo_clean in estab_exist_clean or 
+                            estab_exist_clean in estab_novo_clean):
+                            logger.info(f"Duplicidade detectada no Google Sheets ({nome_aba}): {estab_novo} | R$ {valor_novo:.2f} | {data_nova}")
+                            return True
         except APIError as e_api:
             logger.warning(f"Cota de leitura do Google Sheets (429) atingida na duplicidade. Ignorando consulta remota: {e_api}")
         except Exception as e_dup:

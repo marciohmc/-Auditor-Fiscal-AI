@@ -553,14 +553,14 @@ app.post('/webhook', async (req: Request, res: Response) => {
       const isDuplicado = fiscalEntries.slice(0, 20).some((entry) => {
         const dataNova = (parsed.data || '').trim();
         const dataExistente = (entry.data || '').trim();
-        const estabNovo = (parsed.estabelecimento || '').trim().toLowerCase();
-        const estabExistente = (entry.estabelecimento || '').trim().toLowerCase();
+        const estabNovo = (parsed.estabelecimento || '').trim().toLowerCase().replace(/\(.*?\)/g, '').trim();
+        const estabExistente = (entry.estabelecimento || '').trim().toLowerCase().replace(/\(.*?\)/g, '').trim();
         const valorNovo = Number(parsed.valor) || 0;
         const valorExistente = Number(entry.valor) || 0;
 
         return (
           dataNova === dataExistente &&
-          estabNovo === estabExistente &&
+          (estabNovo === estabExistente || (estabNovo && estabExistente && (estabNovo.includes(estabExistente) || estabExistente.includes(estabNovo)))) &&
           Math.abs(valorNovo - valorExistente) < 0.01
         );
       });
