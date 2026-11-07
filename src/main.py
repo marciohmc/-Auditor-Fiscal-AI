@@ -608,6 +608,72 @@ def extrair_data_e_hora_documento(texto: str) -> tuple[str, str]:
 
     return data_encontrada, hora_encontrada
 
+def extrair_itens_documento(texto: str) -> list:
+    """
+    Extrai lista discriminada de produtos / serviços da Nota Fiscal (PDF ou imagem/OCR),
+    identificando a seção DADOS DO PRODUTO / SERVIÇOS de DANFEs, cupons e recibos.
+    Retorna lista de dicionários [{ 'descricao', 'quantidade', 'valor_unitario', 'valor_total_item' }].
+    """
+    if not texto:
+        return []
+
+    itens = []
+    linhas = [l.strip() for l in texto.replace('\r\n', '\n').split('\n') if l.strip()]
+    
+    in_secao_produtos = False
+    for l in linhas:
+        l_upper = l.upper()
+        
+        # Ativa quando entra na seção de produtos/serviços da Nota Fiscal ou DANFE
+        if any(k in l_upper for k in [
+            "DADOS DO PRODUTO", "PRODUTO / SERVIÇO", "PRODUTOS / SERVIÇOS",
+            "DISCRIMINAÇÃO DOS SERVIÇOS", "DESCRIÇÃO DOS PRODUTOS", "ITENS DA NOTA",
+            "CÓDIGO DESCRIÇÃO", "COD. DESCRIÇÃO"
+        ]):
+            in_secao_produtos = True
+            continue
+            
+        # Desativa ao atingir seções posteriores de impostos ou transporte
+        if in_secao_produtos and any(k in l_upper for k in [
+            "DADOS ADICIONAIS", "CÁLCULO DO IMPOSTO", "VALOR TOTAL DA NOTA", 
+            "TRANSPORTADOR", "DADOS DOS TRIBUTOS", "INFORMAÇÕES COMPLEMENTARES"
+        ]):
+            in_secao_produtos = False
+
+        # Padrão 1: Código + Descrição + (Opções NCM/CST) + Qtd + Un + VlrUnit + VlrTotal
+        m1 = re.search(r'^(?:\d{1,6}\s+)?([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\/\s]{3,60}?)\s+(?:UN|KG|L|PC|CX|M|M2|LITRO|UNID|PCT)?\s*(\d+[\.,]?\d*)\s+[xX*]?\s*(\d+[\.,]\d{2})\s+(\d+[\.,]\d{2})$', l, re.IGNORECASE)
+        if m1:
+            desc = m1.group(1).strip()
+            desc = re.sub(r'\b\d{8}\b|\b\d{4}\b', '', desc).strip()
+            qtd = float(m1.group(2).replace(',', '.'))
+            v_unit = float(m1.group(3).replace(',', '.'))
+            v_tot = float(m1.group(4).replace(',', '.'))
+            if len(desc) >= 3 and v_tot > 0 and not any(k in desc.upper() for k in ["TOTAL", "SUBTOTAL", "TROCO", "DESCONTO", "TRIBUTO"]):
+                itens.append({"descricao": desc, "quantidade": qtd, "valor_unitario": v_unit, "valor_total_item": v_tot})
+                continue
+
+        # Padrão 2: Descrição + Qtd + VlrUnit + VlrTotal
+        m2 = re.search(r'^([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\/\s]{3,60}?)\s+(\d+[\.,]?\d*)\s*(?:UN|KG|L|PC|CX)?\s*(?:x|\*|R\$)?\s*(\d+[\.,]\d{2})\s*(?:=|\s)\s*R?\$?\s*(\d+[\.,]\d{2})$', l, re.IGNORECASE)
+        if m2:
+            desc = m2.group(1).strip()
+            qtd = float(m2.group(2).replace(',', '.'))
+            v_unit = float(m2.group(3).replace(',', '.'))
+            v_tot = float(m2.group(4).replace(',', '.'))
+            if len(desc) >= 3 and v_tot > 0 and not any(k in desc.upper() for k in ["TOTAL", "SUBTOTAL", "TROCO", "DESCONTO", "TRIBUTO"]):
+                itens.append({"descricao": desc, "quantidade": qtd, "valor_unitario": v_unit, "valor_total_item": v_tot})
+                continue
+
+        # Padrão 3: Descrição de Serviço em Nota de Serviços + Valor Total
+        if in_secao_produtos:
+            m3 = re.search(r'^([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\/\s]{4,70}?)\s+R?\$?\s*(\d+[\.,]\d{2})$', l, re.IGNORECASE)
+            if m3:
+                desc = m3.group(1).strip()
+                v_tot = float(m3.group(2).replace(',', '.'))
+                if len(desc) >= 4 and v_tot > 0 and not any(k in desc.upper() for k in ["TOTAL", "SUBTOTAL", "DESCONTO", "VALOR", "BASE", "ICMS", "ISS", "PIS", "COFINS"]):
+                    itens.append({"descricao": desc, "quantidade": 1.0, "valor_unitario": v_tot, "valor_total_item": v_tot})
+
+    return itens
+
 def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
     """
     Analisa comprovante (foto ou PDF de nota fiscal).
@@ -868,7 +934,7 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
         "doc_pagador": doc_pagador if doc_pagador else None,
         "recebedor": recebedor_pix if recebedor_pix else None,
         "doc_recebedor": doc_recebedor if doc_recebedor else None,
-        "itens": []
+        "itens": extrair_itens_documento(texto_bruto)
     }
 
 def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 50) -> bool:
@@ -1058,6 +1124,49 @@ def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", o
     obs_planilha = str(observacao or "").strip()
     if pagador_ext and "pagador" not in obs_planilha.lower():
         obs_planilha = f"Pagador Pix: {pagador_ext} | {obs_planilha}".strip(" |")
+
+    # 4c. Se houver produtos/serviços discriminados na Nota Fiscal, grava na aba de itens
+    itens_lista = data.get("itens") or []
+    if itens_lista and isinstance(itens_lista, list):
+        nome_aba_itens = f"Itens_{nome_aba}"
+        try:
+            try:
+                ws_itens = sh.worksheet(nome_aba_itens)
+            except Exception:
+                ws_itens = sh.add_worksheet(title=nome_aba_itens, rows=200, cols=8)
+                cabecalho_itens = [
+                    "Data", "Estabelecimento / Emissor", "Tipo Documento",
+                    "Descrição Produto / Serviço", "Quantidade", "Valor Unitário (R$)", "Valor Total Item (R$)", "Responsável"
+                ]
+                ws_itens.append_row(cabecalho_itens, value_input_option='USER_ENTERED')
+                logger.info(f"Nova aba secundária de itens criada: {nome_aba_itens}")
+
+            rows_itens = []
+            for item in itens_lista:
+                desc_i = str(item.get("descricao") or item.get("name") or "Produto/Serviço").strip()
+                qtd_i = float(item.get("quantidade", 1.0))
+                v_unit_i = float(item.get("valor_unitario", item.get("valor_total_item", item.get("valor_total", 0.0))))
+                v_tot_i = float(item.get("valor_total_item", item.get("valor_total", 0.0)))
+                if v_tot_i == 0.0 and v_unit_i > 0.0:
+                    v_tot_i = round(qtd_i * v_unit_i, 2)
+
+                rows_itens.append([
+                    str(data.get("data", "Não Informado")),
+                    str(data.get("estabelecimento", "Não Informado")),
+                    str(data.get("tipo_documento", "Nota Fiscal (PDF)")),
+                    desc_i,
+                    qtd_i,
+                    v_unit_i,
+                    v_tot_i,
+                    resp_planilha
+                ])
+
+            if rows_itens:
+                ws_itens.append_rows(rows_itens, value_input_option='USER_ENTERED')
+                if "Itens" not in obs_planilha:
+                    obs_planilha = f"Ver {len(rows_itens)} itens na aba {nome_aba_itens} | {obs_planilha}".strip(" |")
+        except Exception as e_itens:
+            logger.warning(f"Aviso ao gravar itens na aba secundária {nome_aba_itens}: {e_itens}")
 
     row = [
         str(data.get("data", "Não Informado")),
@@ -1437,6 +1546,19 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             success_msg += f"\n• *Tributos IBPT:* R$ {float(extracted_data.get('tributos', 0)):.2f}"
 
         success_msg += f"\n• *Aba Mensal:* `{nome_aba}`"
+        
+        itens_disc = extracted_data.get("itens") or []
+        if itens_disc:
+            success_msg += f"\n\n🛒 *DADOS DO PRODUTO / SERVIÇOS ({len(itens_disc)}):*"
+            for item_d in itens_disc[:5]:
+                d_desc = item_d.get("descricao") or item_d.get("name") or "Produto/Serviço"
+                d_qtd = item_d.get("quantidade", 1)
+                d_tot = float(item_d.get("valor_total_item", item_d.get("valor_total", 0.0)))
+                success_msg += f"\n  • {d_desc} ({d_qtd}x) — R$ {d_tot:.2f}"
+            if len(itens_disc) > 5:
+                success_msg += f"\n  _... e mais {len(itens_disc) - 5} produto(s)_"
+            success_msg += f"\n  📋 _Detalhes gravados na aba `Itens_{nome_aba}`_"
+
         if observacao:
             success_msg += f"\n• *Obs:* {observacao}"
         success_msg += f"\n\n⚡ *Processado em {t_total:.1f}s* | 📊 *Gravado no Google Sheets!*"
@@ -2309,14 +2431,15 @@ def dashboard_logs_page(request: Request):
             </div>
 
             <div style="margin-top: 16px;">
-                <h3 style="font-size: 14px; font-weight: 700; margin-bottom: 8px;">🛒 Itens Comprados / Discriminados na Nota</h3>
+                <h3 style="font-size: 14px; font-weight: 700; margin-bottom: 8px;">🛒 DADOS DO PRODUTO / SERVIÇOS — Itens Comprados / Discriminados na Nota</h3>
                 <div class="items-table-container">
                     <table>
                         <thead>
                             <tr>
                                 <th>#</th>
-                                <th>Descrição do Item</th>
+                                <th>Descrição do Produto / Serviço</th>
                                 <th class="text-center">Qtd</th>
+                                <th class="text-right">Valor Unit. (R$)</th>
                                 <th class="text-right">Valor Total (R$)</th>
                             </tr>
                         </thead>
@@ -2675,18 +2798,21 @@ def dashboard_logs_page(request: Request):
             if (itens && itens.length > 0) {
                 itens.forEach((item, idx) => {
                     const tr = document.createElement('tr');
+                    const vUnit = parseFloat(item.valor_unitario || item.valor_total_item || item.valor_total || 0);
+                    const vTot = parseFloat(item.valor_total_item || item.valor_total || (vUnit * (item.quantidade || 1)) || 0);
                     tr.innerHTML = `
                         <td class="font-mono text-muted">${idx + 1}</td>
-                        <td class="font-bold">${item.descricao || item.name || 'Item'}</td>
+                        <td class="font-bold">${item.descricao || item.name || 'Produto/Serviço'}</td>
                         <td class="text-center font-mono">${item.quantidade || 1}</td>
-                        <td class="text-right font-mono font-bold">R$ ${(parseFloat(item.valor_total_item || item.valor_total || 0)).toFixed(2)}</td>
+                        <td class="text-right font-mono text-muted">R$ ${vUnit.toFixed(2)}</td>
+                        <td class="text-right font-mono font-bold">R$ ${vTot.toFixed(2)}</td>
                     `;
                     tbody.appendChild(tr);
                 });
             } else {
                 tbody.innerHTML = `
                     <tr>
-                        <td colspan="4" class="text-center text-muted" style="padding:20px;">
+                        <td colspan="5" class="text-center text-muted" style="padding:20px;">
                             Nenhum item individual discriminado na nota.
                         </td>
                     </tr>
