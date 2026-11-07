@@ -539,9 +539,55 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
 
     # --- EXTRAÇÃO AVANÇADA POR PADRÕES (REGEX & OPERACIONAIS) ---
     linhas = [l.strip() for l in texto_bruto.replace('\r\n', '\n').split('\n') if l.strip()]
+    texto_upper = texto_bruto.upper()
     
-    # 1. Estabelecimento (Geralmente a primeira linha relevante)
-    estabelecimento = linhas[0] if linhas else "Desconhecido"
+    # 1. Identificação de Comprovante Pix e Extração do Recebedor / Destinatário
+    is_pix = "PIX" in texto_upper or "COMPROVANTE DE TRANSFERENCIA" in texto_upper or "TRANSFERÊNCIA PIX" in texto_upper
+    recebedor_pix = ""
+    doc_recebedor = ""
+
+    if is_pix:
+        # Padrões comuns em comprovantes bancários: 'Destinatário:', 'Para:', 'Recebedor:', 'Quem recebeu:', 'Pago a:'
+        ancoras_pix = [
+            r'(?:DESTINAT[ÁA]RIO|PARA|RECEBEDOR|BENEFICI[ÁA]RIO|PAGO\s+A|ENVIADO\s+PARA|QUEM\s+RECEBEU|FAVORECIDO|NOME\s+DO\s+RECEBEDOR)[\s:]*([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})',
+        ]
+        for padrao in ancoras_pix:
+            m_rec = re.search(padrao, texto_bruto, re.IGNORECASE)
+            if m_rec:
+                cand = m_rec.group(1).strip()
+                # Remove quebras ou palavras espúrias
+                cand_primeira_linha = [p.strip() for p in cand.split('\n') if p.strip()][0]
+                if len(cand_primeira_linha) > 2 and not any(k in cand_primeira_linha.upper() for k in ["INSTITUIÇÃO", "BANCO", "CHAVE", "VALOR", "DATA"]):
+                    recebedor_pix = cand_primeira_linha
+                    break
+
+        # Fallback de busca em blocos linha a linha (quando o rótulo está em uma linha e o nome na seguinte)
+        if not recebedor_pix:
+            for idx_l, linha_txt in enumerate(linhas):
+                if re.search(r'^(PARA|DESTINAT[ÁA]RIO|RECEBEDOR|BENEFICI[ÁA]RIO|QUEM\s+RECEBEU|FAVORECIDO):?$', linha_txt, re.IGNORECASE):
+                    if idx_l + 1 < len(linhas):
+                        cand_linha = linhas[idx_l + 1].strip()
+                        if len(cand_linha) > 2 and not any(k in cand_linha.upper() for k in ["INSTITUIÇÃO", "BANCO", "CHAVE", "VALOR", "DATA", "CPF", "CNPJ"]):
+                            recebedor_pix = cand_linha
+                            break
+
+        # Tenta capturar CPF ou CNPJ associado ao recebedor (comum vir mascarado ou completo logo após o recebedor)
+        doc_match = re.search(r'(?:CPF|CNPJ)?[\s:]*(\*{2,3}\.?\d{3}\.?\d{3}\-?\*{2}|\d{3}\.?\*{3}\.?\*{3}\-?\d{2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2})', texto_bruto)
+        if doc_match:
+            doc_recebedor = doc_match.group(1)
+
+    # 1b. Estabelecimento / Recebedor Final
+    if recebedor_pix:
+        estabelecimento = recebedor_pix
+        if doc_recebedor:
+            estabelecimento = f"{estabelecimento} ({doc_recebedor})"
+    else:
+        estabelecimento = linhas[0] if linhas else "Desconhecido"
+        # 4. CNPJ (Padrão XX.XXX.XXX/XXXX-XX para notas fiscais tradicionais)
+        cnpj_match = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', texto_bruto)
+        cnpj = cnpj_match.group(0) if cnpj_match else ""
+        if cnpj and "CNPJ:" not in estabelecimento:
+            estabelecimento = f"{estabelecimento} (CNPJ: {cnpj})"
     
     # 2. Data (Procura formato DD/MM/AAAA ou DD/MM/AA)
     data_match = re.search(r'(\d{2}/\d{2}/\d{4})', texto_bruto)
@@ -560,7 +606,7 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
     hora_str = hora_match.group(1) if hora_match else "Não Informada"
     
     # 3. Valor Total
-    valor_match = re.search(r'(?:TOTAL|VALOR A PAGAR|PAGAR|R\$\s*)[\s:]*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
+    valor_match = re.search(r'(?:TOTAL|VALOR A PAGAR|PAGAR|VALOR PAGO|VALOR DA TRANSFER[EÊ]NCIA|VALOR|R\$\s*)[\s:]*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
     if not valor_match:
         valores = re.findall(r'(\d+[\.,]\d{2})', texto_bruto)
         valor = float(valores[-1].replace(',', '.')) if valores else 0.0
@@ -582,16 +628,8 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
     trib_match = re.search(r'(?:TRIB|TRIBUTOS|IMPOSTO|IBPT)[\s\w]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
     trib_val = float(trib_match.group(1).replace(',', '.')) if trib_match else 0.0
 
-    # 4. CNPJ (Padrão XX.XXX.XXX/XXXX-XX)
-    cnpj_match = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', texto_bruto)
-    cnpj = cnpj_match.group(0) if cnpj_match else ""
-    if cnpj:
-        estabelecimento = f"{estabelecimento} (CNPJ: {cnpj})"
-
     # 5. Forma de Pagamento & Bandeira do Cartão
-    texto_upper = texto_bruto.upper()
-    pagamento = "Não Informado"
-    if "PIX" in texto_upper:
+    if is_pix:
         pagamento = "Pix"
     elif "CREDITO" in texto_upper or "CRÉDITO" in texto_upper:
         pagamento = "Cartão de Crédito"
@@ -599,6 +637,8 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
         pagamento = "Cartão de Débito"
     elif "DINHEIRO" in texto_upper:
         pagamento = "Dinheiro"
+    else:
+        pagamento = "Não Informado"
 
     bandeira_str = "Não Informada"
     if "VISA" in texto_upper:
@@ -613,11 +653,16 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
         bandeira_str = "Hipercard"
 
     # 6. Tipo de Documento
-    tipo_doc = "Nota Fiscal (PDF)" if is_pdf else "Cupom Fiscal"
-    if "NFC-E" in texto_upper or "NOTA FISCAL" in texto_upper or "DANFE" in texto_upper:
+    if is_pix:
+        tipo_doc = "Comprovante Pix"
+    elif is_pdf:
+        tipo_doc = "Nota Fiscal (PDF)"
+    elif "NFC-E" in texto_upper or "NOTA FISCAL" in texto_upper or "DANFE" in texto_upper:
         tipo_doc = "Nota Fiscal Eletrônica (DANFE)"
     elif "RECIBO" in texto_upper:
         tipo_doc = "Recibo"
+    else:
+        tipo_doc = "Cupom Fiscal"
 
     return {
         "status_leitura": "sucesso",
