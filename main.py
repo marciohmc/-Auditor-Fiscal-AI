@@ -541,49 +541,63 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
     linhas = [l.strip() for l in texto_bruto.replace('\r\n', '\n').split('\n') if l.strip()]
     texto_upper = texto_bruto.upper()
     
-    # 1. Identificação de Comprovante Pix e Extração do Recebedor / Destinatário
-    is_pix = "PIX" in texto_upper or "COMPROVANTE DE TRANSFERENCIA" in texto_upper or "TRANSFERÊNCIA PIX" in texto_upper
+    # 1. Identificação de Comprovante Pix e Extração do Recebedor / Destinatário (Opções 1 e 2 combinadas)
+    is_pix = any(k in texto_upper for k in ["PIX", "COMPROVANTE DE TRANSFERENCIA", "COMPROVANTE DE PAGAMENTO PIX", "TRANSFERENCIA PIX", "TRANSFERÊNCIA PIX"])
     recebedor_pix = ""
     doc_recebedor = ""
 
     if is_pix:
-        # Padrões comuns em comprovantes bancários: 'Destinatário:', 'Para:', 'Recebedor:', 'Quem recebeu:', 'Pago a:'
-        ancoras_pix = [
-            r'(?:DESTINAT[ÁA]RIO|PARA|RECEBEDOR|BENEFICI[ÁA]RIO|PAGO\s+A|ENVIADO\s+PARA|QUEM\s+RECEBEU|FAVORECIDO|NOME\s+DO\s+RECEBEDOR)[\s:]*([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})',
+        # --- OPÇÃO 1: Âncoras Textuais com Regex na mesma linha ---
+        ancoras_regex = [
+            r'(?:DESTINAT[ÁA]RIO|NOME\s+DO\s+DESTINAT[ÁA]RIO|RECEBEDOR|NOME\s+DO\s+RECEBEDOR|BENEFICI[ÁA]RIO|FAVORECIDO|QUEM\s+RECEBEU|PAGO\s+PARA|PAGO\s+A|ENVIADO\s+PARA|PARA)[\s:]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})',
+            r'(?:DADOS\s+DO\s+DESTINAT[ÁA]RIO|DADOS\s+DE\s+QUEM\s+RECEBEU)[\s\S]*?(?:NOME|RECEBEDOR)[\s:]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})'
         ]
-        for padrao in ancoras_pix:
+        termos_invalidos = ["INSTITUIÇÃO", "INSTITUICAO", "BANCO", "CHAVE", "VALOR", "DATA", "HORA", "PAGADOR", "ORIGEM", "AUTENTICAÇÃO", "TIPO DE CHAVE", "ID DA TRANSAÇÃO"]
+
+        for padrao in ancoras_regex:
             m_rec = re.search(padrao, texto_bruto, re.IGNORECASE)
             if m_rec:
                 cand = m_rec.group(1).strip()
-                # Remove quebras ou palavras espúrias
-                cand_primeira_linha = [p.strip() for p in cand.split('\n') if p.strip()][0]
-                if len(cand_primeira_linha) > 2 and not any(k in cand_primeira_linha.upper() for k in ["INSTITUIÇÃO", "BANCO", "CHAVE", "VALOR", "DATA"]):
-                    recebedor_pix = cand_primeira_linha
+                cand_linha = [p.strip() for p in cand.split('\n') if p.strip()][0]
+                # Limpa pontuações no final
+                cand_linha = re.sub(r'[\:\,\-\;]+$', '', cand_linha).strip()
+                if len(cand_linha) >= 3 and not any(k in cand_linha.upper() for k in termos_invalidos):
+                    recebedor_pix = cand_linha
                     break
 
-        # Fallback de busca em blocos linha a linha (quando o rótulo está em uma linha e o nome na seguinte)
+        # --- OPÇÃO 2: Varredura em Bloco Linha a Linha (Rótulo no topo e Nome na linha seguinte) ---
         if not recebedor_pix:
+            rotulo_regex = r'^(PARA|DESTINAT[ÁA]RIO|RECEBEDOR|BENEFICI[ÁA]RIO|FAVORECIDO|QUEM\s+RECEBEU|DADOS\s+DO\s+RECEBEDOR|DADOS\s+DO\s+DESTINAT[ÁA]RIO):?$'
             for idx_l, linha_txt in enumerate(linhas):
-                if re.search(r'^(PARA|DESTINAT[ÁA]RIO|RECEBEDOR|BENEFICI[ÁA]RIO|QUEM\s+RECEBEU|FAVORECIDO):?$', linha_txt, re.IGNORECASE):
-                    if idx_l + 1 < len(linhas):
-                        cand_linha = linhas[idx_l + 1].strip()
-                        if len(cand_linha) > 2 and not any(k in cand_linha.upper() for k in ["INSTITUIÇÃO", "BANCO", "CHAVE", "VALOR", "DATA", "CPF", "CNPJ"]):
-                            recebedor_pix = cand_linha
-                            break
+                if re.search(rotulo_regex, linha_txt, re.IGNORECASE):
+                    # Procura nas 2 linhas seguintes a primeira linha com o nome do favorecido
+                    for offset in [1, 2]:
+                        if idx_l + offset < len(linhas):
+                            cand_linha = linhas[idx_l + offset].strip()
+                            cand_linha_upper = cand_linha.upper()
+                            # Ignora se a linha seguinte for outro rótulo como "NOME:", "CPF:", "CHAVE:" ou banco
+                            if cand_linha_upper.startswith("NOME:"):
+                                cand_linha = cand_linha[5:].strip()
+                            if len(cand_linha) >= 3 and not any(k in cand_linha.upper() for k in termos_invalidos):
+                                if not re.match(r'^(CPF|CNPJ|CHAVE|BANCO|INSTITUI)', cand_linha_upper):
+                                    recebedor_pix = cand_linha
+                                    break
+                    if recebedor_pix:
+                        break
 
-        # Tenta capturar CPF ou CNPJ associado ao recebedor (comum vir mascarado ou completo logo após o recebedor)
+        # Documento do Recebedor (CPF mascarado/completo ou CNPJ)
         doc_match = re.search(r'(?:CPF|CNPJ)?[\s:]*(\*{2,3}\.?\d{3}\.?\d{3}\-?\*{2}|\d{3}\.?\*{3}\.?\*{3}\-?\d{2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2})', texto_bruto)
         if doc_match:
-            doc_recebedor = doc_match.group(1)
+            doc_recebedor = doc_match.group(1).strip()
 
-    # 1b. Estabelecimento / Recebedor Final
+    # 1b. Atribuição do Estabelecimento / Recebedor Final
     if recebedor_pix:
         estabelecimento = recebedor_pix
-        if doc_recebedor:
+        if doc_recebedor and doc_recebedor not in estabelecimento:
             estabelecimento = f"{estabelecimento} ({doc_recebedor})"
     else:
         estabelecimento = linhas[0] if linhas else "Desconhecido"
-        # 4. CNPJ (Padrão XX.XXX.XXX/XXXX-XX para notas fiscais tradicionais)
+        # CNPJ para notas fiscais tradicionais
         cnpj_match = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', texto_bruto)
         cnpj = cnpj_match.group(0) if cnpj_match else ""
         if cnpj and "CNPJ:" not in estabelecimento:
