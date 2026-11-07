@@ -487,77 +487,124 @@ MESES_TEXTO_MAP = {
 
 def extrair_data_e_hora_documento(texto: str) -> tuple[str, str]:
     """
-    Extrai data e hora reais do documento fiscal/comprovante com alta precisão,
-    suportando formatos numéricos, textuais (ex: 05 NOV 2026), ISO (2026-11-05),
-    espaços do OCR e âncoras contextuais bancárias.
+    Extrai data e hora reais do comprovante Pix e de documentos fiscais com alta precisão,
+    suportando IDs Bacen E2E (E00416968YYYYMMDD...), formatos numéricos, textuais (ex: 04 NOV 2026,
+    04 de nov. de 2026), datas sem ano (04 NOV - 15:30), ISO (2026-11-04),
+    quebras de linha após rótulos bancários e tolerância a ruídos de OCR.
     Retorna (data_dd_mm_aaaa, hora_hh_mm).
     """
+    ano_atual = datetime.now().year
     data_encontrada = ""
     hora_encontrada = "Não Informada"
 
-    # 1. Busca por Hora (HH:MM:SS ou HH:MM)
-    m_hora = re.search(r'\b([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?\b', texto)
+    # Normalização de erros comuns de OCR em datas (letra O maiúscula ou minúscula no lugar de zero)
+    texto_norm = re.sub(r"\b([Oo])(\d)[/-]", r"0\2/", texto)
+    texto_norm = re.sub(r"[/.-]([Oo])(\d)[/.-]", r"/0\2/", texto_norm)
+    texto_norm = re.sub(r"[/.-](2[Oo]\d{2})\b", r"/20\g<1>[2:]", texto_norm)
+
+    # 1. Procura E2E ID Bacen (ID da Transação Pix presente em todos os comprovantes)
+    # Formato oficial Banco Central: E + 8 dígitos ISPB + YYYYMMDDHHMM + hash
+    # Exemplo: E00416968202611041830s098234 -> 04/11/2026 às 18:30
+    m_e2e = re.search(r"\bE\d{8}(20\d{2})(\d{2})(\d{2})(\d{2})(\d{2})[A-Za-z0-9]+\b", texto)
+    if m_e2e:
+        ano, mes, dia, hh, mm = int(m_e2e.group(1)), int(m_e2e.group(2)), int(m_e2e.group(3)), m_e2e.group(4), m_e2e.group(5)
+        if 1 <= dia <= 31 and 1 <= mes <= 12 and 2020 <= ano <= 2035:
+            logger.info(f"Data e Hora extraídas do ID da Transação Pix Bacen (E2E): {dia:02d}/{mes:02d}/{ano} {hh}:{mm}")
+            return f"{dia:02d}/{mes:02d}/{ano}", f"{hh}:{mm}"
+
+    # 2. Busca de Hora no comprovante (HH:MM:SS ou HH:MM ou HHhMM)
+    m_hora = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?\b", texto)
     if m_hora:
         hora_encontrada = m_hora.group(0).strip()
+    else:
+        m_hora_h = re.search(r"\b([01]?\d|2[0-3])h([0-5]\d)\b", texto, re.IGNORECASE)
+        if m_hora_h:
+            hora_encontrada = f"{int(m_hora_h.group(1)):02d}:{m_hora_h.group(2)}"
 
-    # 2. Âncoras contextuais que antecedem a data do documento
-    ancoras_data = [
-        r'(?:DATA\s+DO\s+PAGAMENTO|DATA\s+DA\s+TRANSFER[EÊ]NCIA|DATA\s+DA\s+COMPRA|DATA\s+DE\s+EMISS[ÃA]O|EMISS[ÃA]O|DATA/HORA|DATA\s+EMISS[ÃA]O|PAGO\s+EM|REALIZADO\s+EM|TRANSFERIDO\s+EM|DATA)[\s:]*([^\n\r]{3,40})'
+    linhas = [l.strip() for l in texto_norm.replace("\r\n", "\n").split("\n") if l.strip()]
+
+    # 3. Rótulos bancários específicos de comprovantes Pix e notas
+    rotulos_pix = [
+        r"^(?:DATA\s+DO\s+PAGAMENTO|DATA\s+DA\s+TRANSFER[EÊ]NCIA|DATA\s+DA\s+OPERA[CÇ][ÃA]O|DATA\s+DE\s+D[ÉE]BITO|DATA\s+DO\s+ENVIO|DATA\s+E\s+HORA|DATA/HORA|DATA\s+DA\s+TRANSA[CÇ][ÃA]O|DATA|QUANDO|REALIZADO\s+EM|TRANSFERIDO\s+EM|PAGO\s+EM|EMITIDO\s+EM|HOR[ÁA]RIO):?$"
     ]
-    
-    trechos_para_analise = []
-    for anc in ancoras_data:
-        for m in re.finditer(anc, texto, re.IGNORECASE):
-            trechos_para_analise.append(m.group(1))
-    
-    trechos_para_analise.append(texto)
 
     def parse_data_candidata(candidato: str) -> str:
-        # A. Formato Numérico DD/MM/AAAA ou DD.MM.AAAA ou DD-MM-AAAA (com tolerância a espaços de OCR)
-        m_num = re.search(r'\b(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(20\d{2})\b', candidato)
-        if m_num:
-            dia, mes, ano = int(m_num.group(1)), int(m_num.group(2)), int(m_num.group(3))
+        # A. Numérico completo com 4 dígitos: 04/11/2026, 04.11.2026, 04-11-2026, 04 / 11 / 2026
+        m1 = re.search(r"\b(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(20\d{2})\b", candidato)
+        if m1:
+            dia, mes, ano = int(m1.group(1)), int(m1.group(2)), int(m1.group(3))
             if 1 <= dia <= 31 and 1 <= mes <= 12 and 2020 <= ano <= 2035:
                 return f"{dia:02d}/{mes:02d}/{ano}"
 
-        # B. Formato Textual: "05 NOV 2026", "05 de novembro de 2026", "5/nov/2026"
-        m_txt = re.search(r'\b(\d{1,2})\s*(?:de\s+|[/.-])?([A-Za-zÀ-ÖØ-öø-ÿ]{3,10})\s*(?:de\s+|[/.-])?(20\d{2})\b', candidato, re.IGNORECASE)
-        if m_txt:
-            dia = int(m_txt.group(1))
-            mes_txt = m_txt.group(2).lower()
-            ano = int(m_txt.group(3))
+        # B. Textual completo: "04 NOV 2026", "04 de nov. de 2026", "4 de novembro de 2026", "04/nov/2026"
+        m2 = re.search(r"\b(\d{1,2})\s*(?:de\s+|[/.-])?\s*([A-Za-zÀ-ÖØ-öø-ÿ]{3,10})\.?\s*(?:de\s+|[/.-])?\s*(20\d{2})\b", candidato, re.IGNORECASE)
+        if m2:
+            dia = int(m2.group(1))
+            mes_txt = m2.group(2).lower()
+            ano = int(m2.group(3))
             mes_num = MESES_TEXTO_MAP.get(mes_txt[:3]) or MESES_TEXTO_MAP.get(mes_txt)
             if mes_num and 1 <= dia <= 31 and 2020 <= ano <= 2035:
                 return f"{dia:02d}/{mes_num:02d}/{ano}"
 
-        # C. Formato ISO: YYYY-MM-DD ou YYYY/MM/DD
-        m_iso = re.search(r'\b(20\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})\b', candidato)
-        if m_iso:
-            ano, mes, dia = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+        # C. Formato ISO: 2026-11-04 ou 2026/11/04
+        m3 = re.search(r"\b(20\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})\b", candidato)
+        if m3:
+            ano, mes, dia = int(m3.group(1)), int(m3.group(2)), int(m3.group(3))
             if 1 <= dia <= 31 and 1 <= mes <= 12 and 2020 <= ano <= 2035:
                 return f"{dia:02d}/{mes:02d}/{ano}"
 
-        # D. Formato Numérico Curto: DD/MM/AA
-        m_curto = re.search(r'\b(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{2})\b', candidato)
-        if m_curto:
-            dia, mes, ano_curto = int(m_curto.group(1)), int(m_curto.group(2)), int(m_curto.group(3))
-            ano = 2000 + ano_curto
+        # D. Numérico curto com 2 dígitos: 04/11/26 ou 04.11.26
+        m4 = re.search(r"\b(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{2})\b", candidato)
+        if m4:
+            dia, mes, ano_c = int(m4.group(1)), int(m4.group(2)), int(m4.group(3))
+            ano = 2000 + ano_c
             if 1 <= dia <= 31 and 1 <= mes <= 12 and 2020 <= ano <= 2035:
                 return f"{dia:02d}/{mes:02d}/{ano}"
+
+        # E. Textual sem ano (muito comum em telas de extrato Nubank / PicPay): "04 NOV - 15:30", "04 nov.", "4 de novembro"
+        m5 = re.search(r"\b(\d{1,2})\s*(?:de\s+|[/.-])?\s*([A-Za-zÀ-ÖØ-öø-ÿ]{3,10})\.?(?:\s*às|\s*-|\s*$)", candidato, re.IGNORECASE)
+        if m5:
+            dia = int(m5.group(1))
+            mes_txt = m5.group(2).lower()
+            mes_num = MESES_TEXTO_MAP.get(mes_txt[:3]) or MESES_TEXTO_MAP.get(mes_txt)
+            if mes_num and 1 <= dia <= 31:
+                return f"{dia:02d}/{mes_num:02d}/{ano_atual}"
+
+        # F. Numérico sem ano: "04/11 às 15:30" ou "04/11 - 15:30"
+        m6 = re.search(r"\b(\d{1,2})\s*[/]\s*(\d{1,2})(?:\s*às|\s*-|\s*$)", candidato, re.IGNORECASE)
+        if m6:
+            dia, mes = int(m6.group(1)), int(m6.group(2))
+            if 1 <= dia <= 31 and 1 <= mes <= 12:
+                return f"{dia:02d}/{mes:02d}/{ano_atual}"
 
         return ""
 
-    for trecho in trechos_para_analise:
-        res_data = parse_data_candidata(trecho)
-        if res_data:
-            data_encontrada = res_data
-            break
+    # Varre primeiro as linhas próximas a rótulos bancários de data
+    for idx, l in enumerate(linhas):
+        for rot in rotulos_pix:
+            if re.search(rot, l, re.IGNORECASE):
+                # Tenta na própria linha (caso haja texto após o rótulo)
+                res = parse_data_candidata(l)
+                if res:
+                    return res, hora_encontrada
+                # Tenta nas 2 linhas seguintes
+                for off in [1, 2]:
+                    if idx + off < len(linhas):
+                        res = parse_data_candidata(linhas[idx + off])
+                        if res:
+                            return res, hora_encontrada
 
-    # Se realmente nenhuma data for identificada no comprovante (imagem cortada/sem cabeçalho)
+    # Varre todas as linhas do comprovante caso os rótulos não tenham casado
+    for l in linhas:
+        res = parse_data_candidata(l)
+        if res:
+            return res, hora_encontrada
+
+    # Contingência final caso a imagem esteja realmente sem data visível
     if not data_encontrada:
         agora = datetime.now()
         data_encontrada = agora.strftime("%d/%m/%Y")
-        logger.warning(f"Data não detectada no texto do documento. Usando data atual como contingência: {data_encontrada}")
+        logger.warning(f"Data não detectada no comprovante. Usando data de contingência: {data_encontrada}")
 
     return data_encontrada, hora_encontrada
 
@@ -633,7 +680,12 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
     texto_upper = texto_bruto.upper()
     
     # 1. Identificação de Comprovante Pix e Extração do Recebedor e do Pagador (Quem emitiu)
-    is_pix = any(k in texto_upper for k in ["PIX", "COMPROVANTE DE TRANSFERENCIA", "COMPROVANTE DE PAGAMENTO PIX", "TRANSFERENCIA PIX", "TRANSFERÊNCIA PIX"])
+    is_pix = any(k in texto_upper for k in [
+        "PIX", "COMPROVANTE DE TRANSFERENCIA", "COMPROVANTE DE TRANSFERÊNCIA",
+        "COMPROVANTE DE PAGAMENTO PIX", "TRANSFERENCIA PIX", "TRANSFERÊNCIA PIX",
+        "PAGAMENTO PIX", "CHAVE PIX", "ENVIO PIX", "TRANSFERÊNCIA REALIZADA",
+        "PAGAMENTO INSTANTÂNEO", "RECIBO PIX", "CHAVE:"
+    ]) or bool(re.search(r'\bE\d{8}20\d{2}\d{8}', texto_bruto))
     recebedor_pix = ""
     doc_recebedor = ""
     pagador_pix = ""
