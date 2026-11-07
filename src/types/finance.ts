@@ -37,6 +37,12 @@ export interface ExtractedFiscalData {
   categoria: CategoriaDespesa;
   pagamento: FormaPagamento;
   cnpj?: string;
+  pagador?: string | null;
+  doc_pagador?: string | null;
+  recebedor?: string | null;
+  doc_recebedor?: string | null;
+  responsavel?: string | null;
+  observacao?: string | null;
   itens?: ItemComprovante[];
   confidence_score?: number;
   tributos_aproximados?: number;

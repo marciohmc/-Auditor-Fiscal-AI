@@ -324,8 +324,19 @@ export const LedgerTab: React.FC<LedgerTabProps> = ({
                     </td>
 
                     {/* Estabelecimento */}
-                    <td className="py-3.5 px-4 font-semibold text-slate-900 max-w-[220px] truncate">
-                      {entry.estabelecimento}
+                    <td className="py-3.5 px-4 max-w-[240px]">
+                      <div className="font-semibold text-slate-900 truncate">
+                        {entry.estabelecimento}
+                      </div>
+                      {entry.pagador ? (
+                        <div className="text-[10px] text-indigo-700 font-medium truncate mt-0.5">
+                          Pagador: {entry.pagador}
+                        </div>
+                      ) : entry.responsavel ? (
+                        <div className="text-[10px] text-slate-500 font-normal truncate mt-0.5">
+                          Resp: {entry.responsavel}
+                        </div>
+                      ) : null}
                     </td>
 
                     {/* Tipo Documento */}

@@ -135,6 +135,27 @@ export const DocumentModal: React.FC<DocumentModalProps> = ({
                 </span>
               </div>
 
+              {entry.pagador && (
+                <div className="p-3 bg-indigo-50/60 rounded-lg border border-indigo-100">
+                  <span className="text-indigo-600 block font-semibold text-[11px] uppercase tracking-wider">
+                    Quem emitiu (Pagador Pix)
+                  </span>
+                  <span className="text-xs font-semibold text-indigo-950 mt-0.5 block">
+                    {entry.pagador}
+                    {entry.doc_pagador ? ` (${entry.doc_pagador})` : ''}
+                  </span>
+                </div>
+              )}
+
+              {entry.responsavel && (
+                <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+                  <span className="text-slate-400 block font-medium">Responsável na Planilha</span>
+                  <span className="text-xs font-semibold text-slate-800 mt-0.5 block">
+                    {entry.responsavel}
+                  </span>
+                </div>
+              )}
+
               {entry.cnpj && (
                 <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
                   <span className="text-slate-400 block font-medium">CNPJ do Emissor</span>

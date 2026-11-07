@@ -36,6 +36,11 @@ interface StoredFiscalEntry {
   categoria: 'Alimentação' | 'Transporte' | 'Saúde' | 'Lazer' | 'Moradia' | 'Veículo' | 'Educação' | 'Outros';
   pagamento: 'PIX' | 'Cartão de Crédito' | 'Cartão de Débito' | 'Dinheiro' | 'Boleto' | 'Não Informado';
   cnpj?: string;
+  pagador?: string;
+  doc_pagador?: string;
+  recebedor?: string;
+  doc_recebedor?: string;
+  responsavel?: string;
   itens?: Array<{
     descricao: string;
     quantidade: number;
@@ -213,6 +218,8 @@ async function analyzeFiscalImage(base64Data: string, mimeType: string) {
     "4. FORMATAÇÃO E TIPAGEM:\n" +
     "- 'valor': float do valor total líquido (ex: 125.50).\n" +
     "- 'data': padrão DD/MM/AAAA.\n\n" +
+    "5. DADOS DE PIX / COMPROVANTES BANCÁRIOS:\n" +
+    "- Em comprovantes PIX, identifique quem efetuou o pagamento ('pagador') e seu CPF/CNPJ ('doc_pagador'), e quem recebeu ('recebedor' ou 'estabelecimento').\n\n" +
     "Não inclua texto, explicação ou marcações markdown (como ```json) fora do objeto JSON.";
 
   // Resilient model invocation with retry and fallback
@@ -276,6 +283,22 @@ async function analyzeFiscalImage(base64Data: string, mimeType: string) {
               cnpj: {
                 type: Type.STRING,
                 description: "CNPJ do estabelecimento se identificado, senão 'Não Informado'",
+              },
+              pagador: {
+                type: Type.STRING,
+                description: "Nome de quem efetuou o pagamento / emitiu o Pix, se identificado, senão null",
+              },
+              doc_pagador: {
+                type: Type.STRING,
+                description: "CPF ou CNPJ de quem emitiu o Pix / pagou, se identificado, senão null",
+              },
+              recebedor: {
+                type: Type.STRING,
+                description: "Nome do favorecido/recebedor do Pix, se identificado, senão null",
+              },
+              doc_recebedor: {
+                type: Type.STRING,
+                description: "CPF ou CNPJ do favorecido/recebedor do Pix, se identificado, senão null",
               },
               itens: {
                 type: Type.ARRAY,
@@ -569,7 +592,23 @@ app.post('/webhook', async (req: Request, res: Response) => {
       const userFrom = message.from || {};
       const nomeUser = userFrom.first_name || 'Usuário';
       const sobrenomeUser = userFrom.last_name || '';
-      const responsavelCompleto = `${nomeUser} ${sobrenomeUser}`.trim();
+      const telegramUser = userFrom.username ? `@${userFrom.username}` : `${nomeUser} ${sobrenomeUser}`.trim();
+      const responsavelCompleto = `${nomeUser} ${sobrenomeUser}`.trim() || telegramUser;
+
+      // Define quem é o Responsável na planilha:
+      // Se for comprovante Pix e tiver quem emitiu (pagador), prioriza o pagador
+      const pagadorExtraido = parsed.pagador;
+      const docPagadorExtraido = parsed.doc_pagador;
+      let responsavelPlanilha = responsavelCompleto;
+      if (pagadorExtraido) {
+        const docPag = docPagadorExtraido ? ` (${docPagadorExtraido})` : '';
+        const pagadorFmt = `${pagadorExtraido}${docPag}`;
+        if (responsavelCompleto && responsavelCompleto !== 'Usuário' && !pagadorFmt.toLowerCase().includes(responsavelCompleto.toLowerCase())) {
+          responsavelPlanilha = `${pagadorFmt} [Telegram: ${responsavelCompleto}]`;
+        } else {
+          responsavelPlanilha = pagadorFmt;
+        }
+      }
 
       const legendaFoto = (message.caption || req.body.caption || req.body.observacao || '').trim();
 
@@ -583,9 +622,14 @@ app.post('/webhook', async (req: Request, res: Response) => {
         categoria: parsed.categoria,
         pagamento: parsed.pagamento,
         cnpj: parsed.cnpj,
+        pagador: parsed.pagador,
+        doc_pagador: parsed.doc_pagador,
+        recebedor: parsed.recebedor,
+        doc_recebedor: parsed.doc_recebedor,
+        responsavel: responsavelPlanilha,
         itens: parsed.itens,
         status_auditoria: 'auditado',
-        audit_notes: legendaFoto ? `Obs: ${legendaFoto}` : `Lançamento por ${responsavelCompleto} via Telegram Webhook`,
+        audit_notes: legendaFoto ? `Obs: ${legendaFoto}` : `Lançamento por ${responsavelPlanilha} via Telegram Webhook`,
         observacao: legendaFoto || undefined,
         origem: 'telegram_webhook',
         criado_em: new Date().toISOString(),
@@ -599,16 +643,27 @@ app.post('/webhook', async (req: Request, res: Response) => {
         timestamp: new Date().toISOString(),
         chat_id: chatId,
         origem: 'Telegram Webhook',
-        payload_summary: `Foto por ${responsavelCompleto}: ${parsed.estabelecimento} - R$ ${parsed.valor.toFixed(2)}${legendaFoto ? ` (Obs: ${legendaFoto})` : ''}`,
+        payload_summary: `Foto por ${responsavelPlanilha}: ${parsed.estabelecimento} - R$ ${parsed.valor.toFixed(2)}${legendaFoto ? ` (Obs: ${legendaFoto})` : ''}`,
         status: 'sucesso',
         extracted_data: parsed,
       });
 
+      let detalhesPix = '';
+      const isPix = parsed.pagamento === 'PIX' || (parsed.tipo_documento && parsed.tipo_documento.toLowerCase().includes('pix'));
+      if (parsed.pagador) {
+        const docP = parsed.doc_pagador ? ` (${parsed.doc_pagador})` : '';
+        detalhesPix = `• *Quem emitiu (Pagador):* ${parsed.pagador}${docP}\n`;
+      }
+
+      const rotuloEstab = (isPix || parsed.pagador) ? 'Quem recebeu (Destinatário)' : 'Estabelecimento';
+
       let confirmationText = 
         `✅ *Lançamento Registrado com Sucesso!*\n\n` +
-        `• *Responsável:* ${responsavelCompleto}\n` +
+        detalhesPix +
+        `• *${rotuloEstab}:* ${parsed.estabelecimento}\n` +
+        `• *Responsável (Planilha):* ${responsavelPlanilha}\n` +
         `• *Data:* ${parsed.data}\n` +
-        `• *Estabelecimento:* ${parsed.estabelecimento}\n` +
+        `• *Tipo:* ${parsed.tipo_documento}\n` +
         `• *Categoria:* ${parsed.categoria}\n` +
         `• *Pagamento:* ${parsed.pagamento}\n` +
         `• *Valor:* R$ ${Number(parsed.valor).toFixed(2)}`;

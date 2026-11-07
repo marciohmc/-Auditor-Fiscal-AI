@@ -541,41 +541,39 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
     linhas = [l.strip() for l in texto_bruto.replace('\r\n', '\n').split('\n') if l.strip()]
     texto_upper = texto_bruto.upper()
     
-    # 1. Identificação de Comprovante Pix e Extração do Recebedor / Destinatário (Opções 1 e 2 combinadas)
+    # 1. Identificação de Comprovante Pix e Extração do Recebedor e do Pagador (Quem emitiu)
     is_pix = any(k in texto_upper for k in ["PIX", "COMPROVANTE DE TRANSFERENCIA", "COMPROVANTE DE PAGAMENTO PIX", "TRANSFERENCIA PIX", "TRANSFERÊNCIA PIX"])
     recebedor_pix = ""
     doc_recebedor = ""
+    pagador_pix = ""
+    doc_pagador = ""
 
     if is_pix:
-        # --- OPÇÃO 1: Âncoras Textuais com Regex na mesma linha ---
-        ancoras_regex = [
+        termos_invalidos = ["INSTITUIÇÃO", "INSTITUICAO", "BANCO", "CHAVE", "VALOR", "DATA", "HORA", "PAGADOR", "ORIGEM", "AUTENTICAÇÃO", "TIPO DE CHAVE", "ID DA TRANSAÇÃO", "TRANSFERÊNCIA", "COMPROVANTE"]
+
+        # --- A. QUEM RECEBEU (Destinatário / Favorecido) ---
+        ancoras_recebedor = [
             r'(?:DESTINAT[ÁA]RIO|NOME\s+DO\s+DESTINAT[ÁA]RIO|RECEBEDOR|NOME\s+DO\s+RECEBEDOR|BENEFICI[ÁA]RIO|FAVORECIDO|QUEM\s+RECEBEU|PAGO\s+PARA|PAGO\s+A|ENVIADO\s+PARA|PARA)[\s:]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})',
             r'(?:DADOS\s+DO\s+DESTINAT[ÁA]RIO|DADOS\s+DE\s+QUEM\s+RECEBEU)[\s\S]*?(?:NOME|RECEBEDOR)[\s:]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})'
         ]
-        termos_invalidos = ["INSTITUIÇÃO", "INSTITUICAO", "BANCO", "CHAVE", "VALOR", "DATA", "HORA", "PAGADOR", "ORIGEM", "AUTENTICAÇÃO", "TIPO DE CHAVE", "ID DA TRANSAÇÃO"]
-
-        for padrao in ancoras_regex:
+        for padrao in ancoras_recebedor:
             m_rec = re.search(padrao, texto_bruto, re.IGNORECASE)
             if m_rec:
                 cand = m_rec.group(1).strip()
                 cand_linha = [p.strip() for p in cand.split('\n') if p.strip()][0]
-                # Limpa pontuações no final
                 cand_linha = re.sub(r'[\:\,\-\;]+$', '', cand_linha).strip()
                 if len(cand_linha) >= 3 and not any(k in cand_linha.upper() for k in termos_invalidos):
                     recebedor_pix = cand_linha
                     break
 
-        # --- OPÇÃO 2: Varredura em Bloco Linha a Linha (Rótulo no topo e Nome na linha seguinte) ---
         if not recebedor_pix:
             rotulo_regex = r'^(PARA|DESTINAT[ÁA]RIO|RECEBEDOR|BENEFICI[ÁA]RIO|FAVORECIDO|QUEM\s+RECEBEU|DADOS\s+DO\s+RECEBEDOR|DADOS\s+DO\s+DESTINAT[ÁA]RIO):?$'
             for idx_l, linha_txt in enumerate(linhas):
                 if re.search(rotulo_regex, linha_txt, re.IGNORECASE):
-                    # Procura nas 2 linhas seguintes a primeira linha com o nome do favorecido
                     for offset in [1, 2]:
                         if idx_l + offset < len(linhas):
                             cand_linha = linhas[idx_l + offset].strip()
                             cand_linha_upper = cand_linha.upper()
-                            # Ignora se a linha seguinte for outro rótulo como "NOME:", "CPF:", "CHAVE:" ou banco
                             if cand_linha_upper.startswith("NOME:"):
                                 cand_linha = cand_linha[5:].strip()
                             if len(cand_linha) >= 3 and not any(k in cand_linha.upper() for k in termos_invalidos):
@@ -585,10 +583,54 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
                     if recebedor_pix:
                         break
 
-        # Documento do Recebedor (CPF mascarado/completo ou CNPJ)
-        doc_match = re.search(r'(?:CPF|CNPJ)?[\s:]*(\*{2,3}\.?\d{3}\.?\d{3}\-?\*{2}|\d{3}\.?\*{3}\.?\*{3}\-?\d{2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2})', texto_bruto)
-        if doc_match:
-            doc_recebedor = doc_match.group(1).strip()
+        # --- B. QUEM EMITIU O PIX (Pagador / Origem / Titular) ---
+        ancoras_pagador = [
+            r'(?:PAGADOR|NOME\s+DO\s+PAGADOR|ORIGEM|DADOS\s+DO\s+PAGADOR|DADOS\s+DE\s+QUEM\s+PAGOU|QUEM\s+PAGOU|DEBITADO\s+DE|CONTA\s+DE\s+D[ÉE]BITO|CONTA\s+DE\s+ORIGEM|PAGO\s+POR|ENVIADO\s+POR|TITULAR)[\s:]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})',
+            r'(?:DADOS\s+DO\s+PAGADOR|DADOS\s+DE\s+QUEM\s+PAGOU|ORIGEM|CONTA\s+DE\s+ORIGEM|DEBITADO\s+DE)[\s\S]*?(?:NOME|PAGADOR|TITULAR)[\s:]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})',
+            r'(?:^|\n)\s*DE[\s:]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})'
+        ]
+        for padrao_p in ancoras_pagador:
+            m_pag = re.search(padrao_p, texto_bruto, re.IGNORECASE)
+            if m_pag:
+                cand_p = m_pag.group(1).strip()
+                cand_p_linha = [p.strip() for p in cand_p.split('\n') if p.strip()][0]
+                cand_p_linha = re.sub(r'[\:\,\-\;]+$', '', cand_p_linha).strip()
+                if len(cand_p_linha) >= 3 and not any(k in cand_p_linha.upper() for k in termos_invalidos):
+                    if cand_p_linha.upper() != (recebedor_pix or "").upper():
+                        pagador_pix = cand_p_linha
+                        break
+
+        if not pagador_pix:
+            rotulo_pagador_regex = r'^(DE|PAGADOR|ORIGEM|QUEM\s+PAGOU|DADOS\s+DO\s+PAGADOR|DADOS\s+DE\s+QUEM\s+PAGOU|CONTA\s+DE\s+ORIGEM|DEBITADO\s+DE):?$'
+            for idx_p, linha_p in enumerate(linhas):
+                if re.search(rotulo_pagador_regex, linha_p.strip(), re.IGNORECASE):
+                    for offset in [1, 2, 3]:
+                        if idx_p + offset < len(linhas):
+                            cand_pl = linhas[idx_p + offset].strip()
+                            cand_pl_upper = cand_pl.upper()
+                            if cand_pl_upper.startswith("NOME:"):
+                                cand_pl = cand_pl[5:].strip()
+                            elif re.match(r'^(PAGADOR|TITULAR):\s*', cand_pl, re.IGNORECASE):
+                                cand_pl = re.sub(r'^(PAGADOR|TITULAR):\s*', '', cand_pl, flags=re.IGNORECASE).strip()
+                            if len(cand_pl) >= 3 and not any(k in cand_pl.upper() for k in termos_invalidos):
+                                if not re.match(r'^(CPF|CNPJ|CHAVE|BANCO|INSTITUI|AG[EÊ]NCIA|CONTA|DATA|VALOR)', cand_pl_upper):
+                                    if cand_pl.upper() != (recebedor_pix or "").upper():
+                                        pagador_pix = cand_pl
+                                        break
+                    if pagador_pix:
+                        break
+
+        # Documentos do Recebedor e Pagador (CPF/CNPJ)
+        docs_encontrados = re.findall(r'(\*{2,3}\.?\d{3}\.?\d{3}\-?\*{2}|\d{3}\.?\*{3}\.?\*{3}\-?\d{2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2})', texto_bruto)
+        if docs_encontrados:
+            doc_recebedor = docs_encontrados[0]
+            if len(docs_encontrados) > 1:
+                doc_pagador = docs_encontrados[1]
+
+        # Tenta localizar documento explicitamente vinculado ao pagador
+        m_doc_pag = re.search(r'(?:PAGADOR|ORIGEM|DEBITADO\s+DE|QUEM\s+PAGOU|PAGO\s+POR|DADOS\s+DO\s+PAGADOR|DE:)[\s\S]{1,120}?(?:CPF|CNPJ)?[\s:]*(\*{2,3}\.?\d{3}\.?\d{3}\-?\*{2}|\d{3}\.?\*{3}\.?\*{3}\-?\d{2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2})', texto_bruto, re.IGNORECASE)
+        if m_doc_pag:
+            doc_pagador = m_doc_pag.group(1).strip()
 
     # 1b. Atribuição do Estabelecimento / Recebedor Final
     if recebedor_pix:
@@ -692,6 +734,10 @@ def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
         "desconto": desconto_val,
         "troco": troco_val,
         "tributos": trib_val,
+        "pagador": pagador_pix if pagador_pix else None,
+        "doc_pagador": doc_pagador if doc_pagador else None,
+        "recebedor": recebedor_pix if recebedor_pix else None,
+        "doc_recebedor": doc_recebedor if doc_recebedor else None,
         "itens": []
     }
 
@@ -841,6 +887,25 @@ def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", o
     else:
         formula_link = "Armazenado no Telegram"
 
+    # 4b. Formata o Responsável e Observação para o Google Sheets
+    # Se houver pagador identificado no comprovante Pix, grava-o como Responsável (coluna 12)
+    resp_planilha = str(responsavel or "").strip()
+    pagador_ext = data.get("pagador")
+    doc_pag_ext = data.get("doc_pagador")
+    if pagador_ext:
+        doc_s = f" ({doc_pag_ext})" if doc_pag_ext else ""
+        pagador_fmt = f"{pagador_ext}{doc_s}"
+        if not resp_planilha or resp_planilha == "Não Informado":
+            resp_planilha = pagador_fmt
+        elif pagador_ext.lower() not in resp_planilha.lower():
+            resp_planilha = f"{pagador_fmt} [Telegram: {resp_planilha}]"
+    elif not resp_planilha:
+        resp_planilha = "Não Informado"
+
+    obs_planilha = str(observacao or "").strip()
+    if pagador_ext and "pagador" not in obs_planilha.lower():
+        obs_planilha = f"Pagador Pix: {pagador_ext} | {obs_planilha}".strip(" |")
+
     row = [
         str(data.get("data", "Não Informado")),
         str(data.get("hora", "Não Informada")),
@@ -853,9 +918,9 @@ def append_to_sheet_aba_mensal(data: dict, file_id: str, url_direta: str = "", o
         float(data.get("desconto", 0.0)),
         float(data.get("troco", 0.0)),
         float(data.get("tributos", 0.0)),
-        str(responsavel or "Não Informado"),
+        resp_planilha,
         formula_link,
-        str(observacao or "")
+        obs_planilha
     ]
 
     # Tentativas com backoff automático contra erro 429
@@ -1120,8 +1185,32 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             try:
                 log_entry["link_telegram"] = url_direta_imagem
                 
+                # Define o responsável na planilha (priorizando quem emitiu o Pix se identificado)
+                pagador_extraido = extracted_data.get("pagador")
+                doc_pagador = extracted_data.get("doc_pagador")
+                if pagador_extraido:
+                    doc_s = f" ({doc_pagador})" if doc_pagador else ""
+                    pagador_fmt = f"{pagador_extraido}{doc_s}"
+                    if responsavel and responsavel != "Não Informado" and responsavel.lower() not in pagador_fmt.lower():
+                        responsavel_planilha = f"{pagador_fmt} [Telegram: {responsavel}]"
+                    else:
+                        responsavel_planilha = pagador_fmt
+                else:
+                    responsavel_planilha = responsavel or "Não Informado"
+
+                log_entry["responsavel"] = responsavel_planilha
+                log_entry["username"] = responsavel_planilha
+                if pagador_extraido:
+                    log_entry["pagador"] = pagador_extraido
+
                 t_write_start = time.time()
-                total_linhas, nome_aba = append_to_sheet_aba_mensal(extracted_data, file_id, url_direta_imagem, observacao=observacao, responsavel=responsavel)
+                total_linhas, nome_aba = append_to_sheet_aba_mensal(
+                    extracted_data, 
+                    file_id, 
+                    url_direta_imagem, 
+                    observacao=observacao, 
+                    responsavel=responsavel_planilha
+                )
                 t_sheets_write = time.time() - t_write_start
 
                 t_total = time.time() - t_start
@@ -1146,7 +1235,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
 
                 log_entry["status_sheets"] = "Enviado com Sucesso"
                 log_entry["aba_planilha"] = nome_aba
-                det_extra = f" | Aba: {nome_aba} | Linha: {total_linhas} | Responsável: {responsavel} | Tempo Total: {t_total:.2f}s"
+                det_extra = f" | Aba: {nome_aba} | Linha: {total_linhas} | Responsável: {responsavel_planilha} | Tempo Total: {t_total:.2f}s"
                 if observacao:
                     det_extra += f" | Obs: {observacao}"
                 log_entry["detalhes"] += det_extra
@@ -1168,11 +1257,21 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
         if extracted_data.get('bandeira') and extracted_data.get('bandeira') != 'Não Informada':
             pagamento_str += f" ({extracted_data.get('bandeira')})"
 
+        detalhes_pix = ""
+        is_pix_doc = "PIX" in str(extracted_data.get('tipo_documento', '')).upper() or "PIX" in str(extracted_data.get('pagamento', '')).upper()
+        if extracted_data.get("pagador"):
+            doc_p = f" ({extracted_data.get('doc_pagador')})" if extracted_data.get('doc_pagador') else ""
+            detalhes_pix = f"• *Quem emitiu (Pagador):* {extracted_data.get('pagador')}{doc_p}\n"
+
+        rotulo_dest = "Quem recebeu (Destinatário)" if (is_pix_doc or extracted_data.get("pagador")) else "Estabelecimento"
+
         success_msg = (
             "✅ *Lançamento Registrado com Sucesso!*\n\n"
-            f"• *Responsável:* {responsavel}\n"
+            f"{detalhes_pix}"
+            f"• *{rotulo_dest}:* {extracted_data.get('estabelecimento')}\n"
+            f"• *Responsável (Planilha):* {responsavel_planilha}\n"
             f"• *Data/Hora:* {data_hora_str}\n"
-            f"• *Estabelecimento:* {extracted_data.get('estabelecimento')}\n"
+            f"• *Tipo:* {extracted_data.get('tipo_documento')}\n"
             f"• *Categoria:* {extracted_data.get('categoria')}\n"
             f"• *Pagamento:* {pagamento_str}\n"
             f"• *Valor Total:* R$ {float(extracted_data.get('valor', 0)):.2f}"
