@@ -47,6 +47,7 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({ onEntrySaved }) => {
   const [editablePagamento, setEditablePagamento] = useState<string>('Não Informado');
   const [editableTipo, setEditableTipo] = useState<string>('Nota Fiscal');
   const [isEditing, setIsEditing] = useState(false);
+  const [tokenUsage, setTokenUsage] = useState<{ prompt_tokens: number; output_tokens: number; total_tokens: number } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
@@ -114,6 +115,11 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({ onEntrySaved }) => {
 
       setExtractedData(result.extracted);
       setRawJson(result.raw_json || JSON.stringify(result.extracted, null, 2));
+      if (result.token_usage) {
+        setTokenUsage(result.token_usage);
+      } else {
+        setTokenUsage(null);
+      }
 
       // Init editable fields
       setEditableEstabelecimento(result.extracted.estabelecimento || '');
@@ -183,6 +189,7 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({ onEntrySaved }) => {
     setActiveSampleId(null);
     setIsEditing(false);
     setSavedSuccess(false);
+    setTokenUsage(null);
   };
 
   return (
@@ -447,9 +454,17 @@ export const ScannerTab: React.FC<ScannerTabProps> = ({ onEntrySaved }) => {
                     <h3 className="text-sm font-bold text-slate-900">
                       Dados Fiscais Extraídos com Sucesso
                     </h3>
-                    <p className="text-[11px] text-slate-500">
-                      Classificação rigorosa em formato JSON padronizado
-                    </p>
+                    <div className="flex flex-wrap items-center gap-1.5 mt-0.5 text-[11px] text-slate-500">
+                      <span>Motor: <strong className="text-emerald-700">Google Gemini 3.8 Flash</strong></span>
+                      {tokenUsage && tokenUsage.total_tokens > 0 && (
+                        <>
+                          <span>·</span>
+                          <span className="font-mono text-emerald-800 bg-emerald-50 px-1.5 py-0.2 rounded border border-emerald-200">
+                            ⚡ {tokenUsage.total_tokens} tokens ({tokenUsage.prompt_tokens} in / {tokenUsage.output_tokens} out)
+                          </span>
+                        </>
+                      )}
+                    </div>
                   </div>
                 </div>
 

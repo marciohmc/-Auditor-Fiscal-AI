@@ -2,7 +2,7 @@ import express, { Request, Response } from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 
 dotenv.config();
 
@@ -54,6 +54,11 @@ interface StoredFiscalEntry {
   raw_json?: string;
   origem: 'upload' | 'camera' | 'telegram_webhook' | 'amostra';
   criado_em: string;
+  token_usage?: {
+    prompt_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+  };
 }
 
 interface WebhookLog {
@@ -66,6 +71,11 @@ interface WebhookLog {
   status: 'sucesso' | 'erro' | 'processando';
   extracted_data?: any;
   error_message?: string;
+  token_usage?: {
+    prompt_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+  };
 }
 
 // Initial realistic Brazilian fiscal dataset
@@ -229,10 +239,11 @@ async function analyzeFiscalImage(base64Data: string, mimeType: string) {
   const userPrompt = 
     "Analise esta imagem/PDF de documento fiscal ou comprovante bancário e extraia os dados conforme o schema JSON configurado.";
 
-  // Resilient model invocation with retry and fallback
+  // Resilient model invocation with gemini-3.8-flash as primary unified AI engine
   const candidateModels = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite'];
   let lastError: any = null;
   let responseText = '';
+  let usageMetrics = { prompt_tokens: 0, output_tokens: 0, total_tokens: 0 };
 
   for (const modelName of candidateModels) {
     try {
@@ -252,6 +263,9 @@ async function analyzeFiscalImage(base64Data: string, mimeType: string) {
         config: {
           systemInstruction,
           responseMimeType: 'application/json',
+          thinkingConfig: {
+            thinkingLevel: ThinkingLevel.LOW,
+          },
           responseSchema: {
             type: Type.OBJECT,
             properties: {
@@ -261,55 +275,55 @@ async function analyzeFiscalImage(base64Data: string, mimeType: string) {
               },
               mensagem_erro: {
                 type: Type.STRING,
-                description: "Mensagem amigável de erro se status_leitura for 'ilegivel', senão null",
+                description: "Mensagem se status_leitura for 'ilegivel', senão null",
               },
               tipo_documento: {
                 type: Type.STRING,
-                description: "Classificação: 'Nota Fiscal', 'Cupom Fiscal' ou 'Recibo'",
+                description: "'Nota Fiscal', 'Cupom Fiscal' ou 'Recibo'",
               },
               data: {
                 type: Type.STRING,
-                description: "Data de emissão DD/MM/AAAA ou 'Não Informado'",
+                description: "Data DD/MM/AAAA ou 'Não Informado'",
               },
               estabelecimento: {
                 type: Type.STRING,
-                description: "Nome do fornecedor, loja ou prestador de serviço",
+                description: "Fornecedor ou favorecido Pix",
               },
               valor: {
                 type: Type.NUMBER,
-                description: "Valor total líquido do comprovante (ex: 45.90)",
+                description: "Valor total líquido (ex: 45.90)",
               },
               categoria: {
                 type: Type.STRING,
-                description: "Categoria do gasto: Alimentação, Transporte, Saúde, Lazer, Moradia, Veículo, Educação ou Outros",
+                description: "Alimentação, Transporte, Saúde, Lazer, Moradia, Veículo, Educação ou Outros",
               },
               pagamento: {
                 type: Type.STRING,
-                description: "Forma de pagamento: PIX, Cartão de Crédito, Cartão de Débito, Dinheiro, Boleto ou Não Informado",
+                description: "PIX, Cartão de Crédito, Cartão de Débito, Dinheiro, Boleto ou Não Informado",
               },
               cnpj: {
                 type: Type.STRING,
-                description: "CNPJ do estabelecimento se identificado, senão 'Não Informado'",
+                description: "CNPJ/CPF se identificado",
               },
               pagador: {
                 type: Type.STRING,
-                description: "Nome de quem efetuou o pagamento / emitiu o Pix, se identificado, senão null",
+                description: "Quem emitiu o Pix / pagou",
               },
               doc_pagador: {
                 type: Type.STRING,
-                description: "CPF ou CNPJ de quem emitiu o Pix / pagou, se identificado, senão null",
+                description: "CPF/CNPJ de quem emitiu o Pix / pagou",
               },
               recebedor: {
                 type: Type.STRING,
-                description: "Nome do favorecido/recebedor do Pix, se identificado, senão null",
+                description: "Nome do favorecido do Pix",
               },
               doc_recebedor: {
                 type: Type.STRING,
-                description: "CPF ou CNPJ do favorecido/recebedor do Pix, se identificado, senão null",
+                description: "CPF/CNPJ do favorecido",
               },
               itens: {
                 type: Type.ARRAY,
-                description: "Itens comprados listados no cupom/nota fiscal",
+                description: "Itens listados no cupom/nota fiscal",
                 items: {
                   type: Type.OBJECT,
                   properties: {
@@ -329,6 +343,13 @@ async function analyzeFiscalImage(base64Data: string, mimeType: string) {
       });
 
       responseText = (response.text ?? '').trim();
+      if (response.usageMetadata) {
+        usageMetrics = {
+          prompt_tokens: response.usageMetadata.promptTokenCount || 0,
+          output_tokens: response.usageMetadata.candidatesTokenCount || 0,
+          total_tokens: response.usageMetadata.totalTokenCount || 0,
+        };
+      }
       if (responseText) {
         break; // Success
       }
@@ -336,12 +357,12 @@ async function analyzeFiscalImage(base64Data: string, mimeType: string) {
       console.warn(`Tentativa com ${modelName} falhou:`, err?.message || err);
       lastError = err;
       // Brief pause before trying fallback model
-      await new Promise((res) => setTimeout(res, 600));
+      await new Promise((res) => setTimeout(res, 500));
     }
   }
 
   if (!responseText) {
-    throw lastError || new Error('Não foi possível obter resposta do modelo de IA.');
+    throw lastError || new Error('Não foi possível obter resposta do Gemini 3.8 Flash.');
   }
 
   const rawText = responseText;
@@ -381,6 +402,8 @@ async function analyzeFiscalImage(base64Data: string, mimeType: string) {
   return {
     parsed,
     rawText: cleaned.trim(),
+    usage: usageMetrics,
+    engine: 'gemini-3.8-flash',
   };
 }
 
@@ -425,12 +448,14 @@ app.post('/api/extract', async (req: Request, res: Response) => {
       base64Data = parts[1];
     }
 
-    const { parsed, rawText } = await analyzeFiscalImage(base64Data, detectedMime);
+    const { parsed, rawText, usage, engine } = await analyzeFiscalImage(base64Data, detectedMime);
 
     return res.json({
       success: true,
       extracted: parsed,
       raw_json: rawText,
+      token_usage: usage,
+      engine: engine || 'gemini-3.8-flash',
     });
   } catch (error: any) {
     let userMsg = error.message || 'Falha ao processar e extrair dados da imagem fiscal.';
@@ -533,7 +558,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
         base64Data = parts[1];
       }
 
-      const { parsed, rawText } = await analyzeFiscalImage(base64Data, mimeType);
+      const { parsed, rawText, usage } = await analyzeFiscalImage(base64Data, mimeType);
 
       // Verificação de legibilidade do comprovante
       if (parsed.status_leitura === 'ilegivel') {
@@ -547,6 +572,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
           status: 'erro',
           extracted_data: parsed,
           error_message: mensagemUsuario,
+          token_usage: usage,
         });
 
         return res.status(200).json({
@@ -587,6 +613,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
           status: 'erro',
           extracted_data: parsed,
           error_message: 'Comprovante idêntico já cadastrado recentemente',
+          token_usage: usage,
         });
 
         return res.status(200).json({
@@ -636,11 +663,12 @@ app.post('/webhook', async (req: Request, res: Response) => {
         responsavel: responsavelPlanilha,
         itens: parsed.itens,
         status_auditoria: 'auditado',
-        audit_notes: legendaFoto ? `Obs: ${legendaFoto}` : `Lançamento por ${responsavelPlanilha} via Telegram Webhook`,
+        audit_notes: legendaFoto ? `Obs: ${legendaFoto}` : `Lançamento por ${responsavelPlanilha} via Telegram Webhook (Gemini 3.8 Flash)`,
         observacao: legendaFoto || undefined,
         origem: 'telegram_webhook',
         criado_em: new Date().toISOString(),
         raw_json: rawText,
+        token_usage: usage,
       };
 
       fiscalEntries.unshift(newEntry);
@@ -653,6 +681,7 @@ app.post('/webhook', async (req: Request, res: Response) => {
         payload_summary: `Foto por ${responsavelPlanilha}: ${parsed.estabelecimento} - R$ ${parsed.valor.toFixed(2)}${legendaFoto ? ` (Obs: ${legendaFoto})` : ''}`,
         status: 'sucesso',
         extracted_data: parsed,
+        token_usage: usage,
       });
 
       let detalhesPix = '';

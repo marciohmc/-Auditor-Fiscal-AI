@@ -27,13 +27,6 @@ except ImportError:
     PdfReader = None
     PYPDF_AVAILABLE = False
 
-try:
-    from huggingface_hub import InferenceClient
-    HF_HUB_AVAILABLE = True
-except ImportError:
-    InferenceClient = None
-    HF_HUB_AVAILABLE = False
-
 # Configuração de Logs
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("finance-bot")
@@ -45,9 +38,6 @@ GEMINI_API_KEY_1 = os.getenv("GEMINI_API_KEY_1")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 PASSCM = os.getenv("PASSCM", "").strip()
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
-HF_MODEL_URL = os.getenv("HF_MODEL_URL", "https://api-inference.huggingface.co/models/microsoft/Florence-2-large")
-OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
 
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 
@@ -676,265 +666,198 @@ def extrair_itens_documento(texto: str) -> list:
 
 def analyze_receipt(file_bytes: bytes, is_pdf: bool = False) -> dict:
     """
-    Analisa comprovante (foto ou PDF de nota fiscal).
-    Se for PDF, tenta extração nativa digital via pypdf (em milissegundos).
-    Se for foto ou PDF escaneado, realiza OCR via OCR.space.
+    Analisa comprovante fiscal ou bancário (foto ou PDF) exclusivamente com o Google Gemini 3.8 Flash.
+    Utiliza processamento multimodal nativo com mínimo consumo de tokens e máxima precisão.
     """
-    texto_bruto = ""
+    import base64
+    global current_key_index
 
-    # 1. Se for arquivo PDF, tenta extração nativa digital em memória via pypdf
-    if is_pdf and PYPDF_AVAILABLE and PdfReader is not None:
-        try:
-            logger.info("Tentando extração de texto digital do PDF via pypdf...")
-            reader = PdfReader(io.BytesIO(file_bytes))
-            pypdf_text = ""
-            for page in reader.pages:
-                extracted = page.extract_text()
-                if extracted:
-                    pypdf_text += extracted + "\n"
-            if len(pypdf_text.strip()) >= 15:
-                texto_bruto = pypdf_text.strip()
-                logger.info(f"Texto do PDF extraído digitalmente com sucesso ({len(texto_bruto)} chars)!")
-        except Exception as e_pdf:
-            logger.warning(f"Extração nativa do PDF via pypdf falhou ({e_pdf}). Acionando OCR.space...")
-
-    # 2. Se não for PDF ou se a extração nativa digital retornou vazia, usa a API OCR.space
-    if not texto_bruto:
-        api_key = os.getenv("OCR_SPACE_API_KEY", "helloworld")
-        url = "https://api.ocr.space/parse/image"
-        
-        payload = {
-            'isOverlayRequired': False,
-            'apikey': api_key,
-            'language': 'por',
+    if not GEMINI_KEYS:
+        return {
+            "status_leitura": "ilegivel",
+            "mensagem_erro": "Nenhuma chave GEMINI_API_KEY configurada no ambiente."
         }
-        if is_pdf:
-            payload['filetype'] = 'PDF'
-            files = {'file': ('nota_fiscal.pdf', file_bytes, 'application/pdf')}
-        else:
-            files = {'file': ('comprovante.jpg', file_bytes, 'image/jpeg')}
 
+    b64_data = base64.b64encode(file_bytes).decode("utf-8")
+    mime_type = "application/pdf" if is_pdf else "image/jpeg"
+
+    system_instruction = (
+        "Você é um auditor financeiro sênior especialista em extração multimodal de dados de documentos fiscais e bancários brasileiros (Notas Fiscais DANFE/NFC-e, Cupons Fiscais, Recibos e Comprovantes de Pagamento/Pix).\n\n"
+        "Sua missão é analisar minuciosamente o documento enviado e extrair estritamente as informações financeiras em formato JSON conforme as diretrizes abaixo:\n\n"
+        "1. VALIDAÇÃO DE LEGIBILIDADE (CRÍTICO):\n"
+        "- Se o documento estiver ilegível, rasurado ou cortado nos dados essenciais (valor total, data ou estabelecimento/favorecido), defina 'status_leitura': 'ilegivel' e forneça uma explicação clara em 'mensagem_erro'.\n"
+        "- Se legível, defina 'status_leitura': 'sucesso' e 'mensagem_erro': null.\n\n"
+        "2. EXTRAÇÃO DE DATA E HORA REAL DO COMPROVANTE:\n"
+        "- Extraia ESTRITAMENTE a data de emissão ou realização da transação impressa no próprio documento (formato DD/MM/AAAA).\n"
+        "- NUNCA utilize a data atual do sistema, nem a data de envio da foto.\n"
+        "- Em comprovantes Pix, busque a data e hora registradas no comprovante bancário ou no ID da transação Bacen (E2E).\n\n"
+        "3. REGRA ESPECIAL PARA COMPROVANTES PIX E TRANSFERÊNCIAS:\n"
+        "- 'pagador': Nome completo da pessoa ou empresa que efetuou a transferência/pagamento (Origem/Débito).\n"
+        "- 'doc_pagador': CPF ou CNPJ de quem pagou.\n"
+        "- 'recebedor' / 'estabelecimento': Nome da pessoa ou empresa que recebeu o valor (Destinatário/Favorecido/Crédito).\n"
+        "- 'doc_recebedor' / 'cnpj': CPF ou CNPJ do favorecido/recebedor.\n"
+        "- 'pagamento': Defina como 'PIX'.\n\n"
+        "4. NOTAS FISCAIS, CUPONS E RECIBOS (ITENS DISCRIMINADOS):\n"
+        "- Mapeie a tabela 'DADOS DO PRODUTO / SERVIÇOS' ou lista de itens no array 'itens'.\n"
+        "- Para cada item capture: 'descricao', 'quantidade' (número), 'valor_unitario' (número) e 'valor_total' (número).\n"
+        "- Se o documento não discriminar itens individuais, retorne 'itens': [].\n\n"
+        "5. CLASSIFICAÇÃO DE CATEGORIA E FORMA DE PAGAMENTO:\n"
+        "- 'tipo_documento': 'Nota Fiscal', 'Cupom Fiscal', 'Recibo' ou 'Comprovante Pix'.\n"
+        "- 'categoria': 'Alimentação', 'Transporte', 'Saúde', 'Lazer', 'Moradia', 'Veículo', 'Educação' ou 'Outros'.\n"
+        "- 'pagamento': 'PIX', 'Cartão de Crédito', 'Cartão de Débito', 'Dinheiro', 'Boleto' ou 'Não Informado'.\n\n"
+        "Retorne ESTRITAMENTE o JSON solicitado, sem blocos de código Markdown."
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": b64_data
+                        }
+                    },
+                    {
+                        "text": "Analise o comprovante e extraia os dados conforme o schema JSON."
+                    }
+                ]
+            }
+        ],
+        "system_instruction": {
+            "parts": [
+                {
+                    "text": system_instruction
+                }
+            ]
+        },
+        "generation_config": {
+            "response_mime_type": "application/json",
+            "thinking_config": {
+                "thinking_level": "LOW"
+            },
+            "response_schema": {
+                "type": "OBJECT",
+                "properties": {
+                    "status_leitura": {"type": "STRING"},
+                    "mensagem_erro": {"type": "STRING"},
+                    "tipo_documento": {"type": "STRING"},
+                    "data": {"type": "STRING"},
+                    "hora": {"type": "STRING"},
+                    "estabelecimento": {"type": "STRING"},
+                    "valor": {"type": "NUMBER"},
+                    "categoria": {"type": "STRING"},
+                    "pagamento": {"type": "STRING"},
+                    "cnpj": {"type": "STRING"},
+                    "pagador": {"type": "STRING"},
+                    "doc_pagador": {"type": "STRING"},
+                    "recebedor": {"type": "STRING"},
+                    "doc_recebedor": {"type": "STRING"},
+                    "itens": {
+                        "type": "ARRAY",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "descricao": {"type": "STRING"},
+                                "quantidade": {"type": "NUMBER"},
+                                "valor_unitario": {"type": "NUMBER"},
+                                "valor_total": {"type": "NUMBER"}
+                            }
+                        }
+                    }
+                },
+                "required": ["status_leitura"]
+            }
+        }
+    }
+
+    tentativas = len(GEMINI_KEYS)
+    ultimo_erro = None
+
+    for _ in range(tentativas):
+        api_key = GEMINI_KEYS[current_key_index % len(GEMINI_KEYS)]
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={api_key}"
         try:
-            logger.info("Enviando arquivo para a API OCR.space...")
-            response = requests.post(url, data=payload, files=files, timeout=30)
-            resultado = response.json()
-            
-            if resultado.get("IsErroredOnProcessing"):
-                erro_msg = resultado.get("ErrorMessage", ["Erro desconhecido"])[0]
-                logger.error(f"Erro no OCR.space: {erro_msg}")
-                return {"status_leitura": "ilegivel", "mensagem_erro": f"Erro OCR: {erro_msg}"}
-                
-            parsed_results = resultado.get("ParsedResults", [])
-            if not parsed_results:
-                return {"status_leitura": "ilegivel", "mensagem_erro": "Nenhum texto detectado no documento."}
-                
-            texto_bruto = parsed_results[0].get("ParsedText", "")
-            if not texto_bruto.strip():
-                return {"status_leitura": "ilegivel", "mensagem_erro": "Documento ilegível ou sem texto."}
+            logger.info(f"Enviando documento ({mime_type}, {len(file_bytes)} bytes) para Google Gemini 3.8 Flash (Chave {current_key_index % len(GEMINI_KEYS) + 1})...")
+            res = requests.post(url, json=payload, headers={"Content-Type": "application/json", "User-Agent": "aistudio-build"}, timeout=30)
 
-            logger.info(f"Texto bruto capturado via OCR.space:\n{texto_bruto[:200]}...")
+            if res.status_code == 429:
+                logger.warning(f"Cota 429 atingida na chave Gemini {current_key_index % len(GEMINI_KEYS) + 1}. Alternando...")
+                rotate_gemini_key()
+                continue
+
+            if res.status_code != 200:
+                logger.error(f"Erro na API Gemini ({res.status_code}): {res.text[:200]}")
+                ultimo_erro = f"Erro API Gemini ({res.status_code})"
+                continue
+
+            resp_json = res.json()
+            candidates = resp_json.get("candidates", [])
+            if not candidates:
+                ultimo_erro = "Nenhum candidato retornado pelo Gemini"
+                continue
+
+            content_parts = candidates[0].get("content", {}).get("parts", [])
+            if not content_parts:
+                ultimo_erro = "Resposta vazia do Gemini"
+                continue
+
+            raw_text = content_parts[0].get("text", "").strip()
+            if raw_text.startswith("```json"):
+                raw_text = raw_text[7:]
+            if raw_text.startswith("```"):
+                raw_text = raw_text[3:]
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3]
+
+            parsed = json.loads(raw_text.strip())
+
+            usage = resp_json.get("usageMetadata", {})
+            prompt_tokens = usage.get("promptTokenCount", 0)
+            cand_tokens = usage.get("candidatesTokenCount", 0)
+            total_tokens = usage.get("totalTokenCount", 0)
+            logger.info(f"Gemini 3.8 Flash processou com sucesso! Tokens: prompt={prompt_tokens}, output={cand_tokens}, total={total_tokens}")
+
+            if parsed.get("status_leitura") != "ilegivel":
+                parsed["status_leitura"] = "sucesso"
+                parsed["mensagem_erro"] = None
+
+            parsed["token_usage"] = {
+                "prompt_tokens": prompt_tokens,
+                "output_tokens": cand_tokens,
+                "total_tokens": total_tokens
+            }
+
+            try:
+                parsed["valor"] = float(parsed.get("valor", 0.0))
+            except (ValueError, TypeError):
+                parsed["valor"] = 0.0
+
+            if not parsed.get("data"):
+                parsed["data"] = datetime.now().strftime("%d/%m/%Y")
+
+            if not parsed.get("estabelecimento"):
+                parsed["estabelecimento"] = parsed.get("recebedor") or "Não Informado"
+
+            if not parsed.get("pagamento"):
+                parsed["pagamento"] = "PIX" if parsed.get("pagador") else "Não Informado"
+
+            if not parsed.get("categoria"):
+                parsed["categoria"] = "Outros"
+
+            return parsed
 
         except requests.exceptions.Timeout:
-            logger.error("Timeout ao conectar com o OCR.space.")
-            return {"status_leitura": "ilegivel", "mensagem_erro": "O serviço de OCR demorou muito para responder."}
-        except Exception as e:
-            logger.error(f"Erro no processamento do OCR: {str(e)}")
-            return {"status_leitura": "ilegivel", "mensagem_erro": f"Erro interno ao processar OCR: {str(e)}"}
-
-    # --- EXTRAÇÃO AVANÇADA POR PADRÕES (REGEX & OPERACIONAIS) ---
-    linhas = [l.strip() for l in texto_bruto.replace('\r\n', '\n').split('\n') if l.strip()]
-    texto_upper = texto_bruto.upper()
-    
-    # 1. Identificação de Comprovante Pix e Extração do Recebedor e do Pagador (Quem emitiu)
-    is_pix = any(k in texto_upper for k in [
-        "PIX", "COMPROVANTE DE TRANSFERENCIA", "COMPROVANTE DE TRANSFERÊNCIA",
-        "COMPROVANTE DE PAGAMENTO PIX", "TRANSFERENCIA PIX", "TRANSFERÊNCIA PIX",
-        "PAGAMENTO PIX", "CHAVE PIX", "ENVIO PIX", "TRANSFERÊNCIA REALIZADA",
-        "PAGAMENTO INSTANTÂNEO", "RECIBO PIX", "CHAVE:"
-    ]) or bool(re.search(r'\bE\d{8}20\d{2}\d{8}', texto_bruto))
-    recebedor_pix = ""
-    doc_recebedor = ""
-    pagador_pix = ""
-    doc_pagador = ""
-
-    if is_pix:
-        termos_invalidos = ["INSTITUIÇÃO", "INSTITUICAO", "BANCO", "CHAVE", "VALOR", "DATA", "HORA", "PAGADOR", "ORIGEM", "AUTENTICAÇÃO", "TIPO DE CHAVE", "ID DA TRANSAÇÃO", "TRANSFERÊNCIA", "COMPROVANTE"]
-
-        # --- A. QUEM RECEBEU (Destinatário / Favorecido) ---
-        ancoras_recebedor = [
-            r'(?:DESTINAT[ÁA]RIO|NOME\s+DO\s+DESTINAT[ÁA]RIO|RECEBEDOR|NOME\s+DO\s+RECEBEDOR|BENEFICI[ÁA]RIO|FAVORECIDO|QUEM\s+RECEBEU|PAGO\s+PARA|PAGO\s+A|ENVIADO\s+PARA|PARA)[\s:]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})',
-            r'(?:DADOS\s+DO\s+DESTINAT[ÁA]RIO|DADOS\s+DE\s+QUEM\s+RECEBEU)[\s\S]*?(?:NOME|RECEBEDOR)[\s:]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})'
-        ]
-        for padrao in ancoras_recebedor:
-            m_rec = re.search(padrao, texto_bruto, re.IGNORECASE)
-            if m_rec:
-                cand = m_rec.group(1).strip()
-                cand_linha = [p.strip() for p in cand.split('\n') if p.strip()][0]
-                cand_linha = re.sub(r'[\:\,\-\;]+$', '', cand_linha).strip()
-                if len(cand_linha) >= 3 and not any(k in cand_linha.upper() for k in termos_invalidos):
-                    recebedor_pix = cand_linha
-                    break
-
-        if not recebedor_pix:
-            rotulo_regex = r'^(PARA|DESTINAT[ÁA]RIO|RECEBEDOR|BENEFICI[ÁA]RIO|FAVORECIDO|QUEM\s+RECEBEU|DADOS\s+DO\s+RECEBEDOR|DADOS\s+DO\s+DESTINAT[ÁA]RIO):?$'
-            for idx_l, linha_txt in enumerate(linhas):
-                if re.search(rotulo_regex, linha_txt, re.IGNORECASE):
-                    for offset in [1, 2]:
-                        if idx_l + offset < len(linhas):
-                            cand_linha = linhas[idx_l + offset].strip()
-                            cand_linha_upper = cand_linha.upper()
-                            if cand_linha_upper.startswith("NOME:"):
-                                cand_linha = cand_linha[5:].strip()
-                            if len(cand_linha) >= 3 and not any(k in cand_linha.upper() for k in termos_invalidos):
-                                if not re.match(r'^(CPF|CNPJ|CHAVE|BANCO|INSTITUI)', cand_linha_upper):
-                                    recebedor_pix = cand_linha
-                                    break
-                    if recebedor_pix:
-                        break
-
-        # --- B. QUEM EMITIU O PIX (Pagador / Origem / Titular) ---
-        ancoras_pagador = [
-            r'(?:PAGADOR|NOME\s+DO\s+PAGADOR|ORIGEM|DADOS\s+DO\s+PAGADOR|DADOS\s+DE\s+QUEM\s+PAGOU|QUEM\s+PAGOU|DEBITADO\s+DE|CONTA\s+DE\s+D[ÉE]BITO|CONTA\s+DE\s+ORIGEM|PAGO\s+POR|ENVIADO\s+POR|TITULAR)[\s:]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})',
-            r'(?:DADOS\s+DO\s+PAGADOR|DADOS\s+DE\s+QUEM\s+PAGOU|ORIGEM|CONTA\s+DE\s+ORIGEM|DEBITADO\s+DE)[\s\S]*?(?:NOME|PAGADOR|TITULAR)[\s:]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})',
-            r'(?:^|\n)\s*DE[\s:]+([A-Za-zÀ-ÖØ-öø-ÿ0-9\.\-\s]{3,60})'
-        ]
-        for padrao_p in ancoras_pagador:
-            m_pag = re.search(padrao_p, texto_bruto, re.IGNORECASE)
-            if m_pag:
-                cand_p = m_pag.group(1).strip()
-                cand_p_linha = [p.strip() for p in cand_p.split('\n') if p.strip()][0]
-                cand_p_linha = re.sub(r'[\:\,\-\;]+$', '', cand_p_linha).strip()
-                if len(cand_p_linha) >= 3 and not any(k in cand_p_linha.upper() for k in termos_invalidos):
-                    if cand_p_linha.upper() != (recebedor_pix or "").upper():
-                        pagador_pix = cand_p_linha
-                        break
-
-        if not pagador_pix:
-            rotulo_pagador_regex = r'^(DE|PAGADOR|ORIGEM|QUEM\s+PAGOU|DADOS\s+DO\s+PAGADOR|DADOS\s+DE\s+QUEM\s+PAGOU|CONTA\s+DE\s+ORIGEM|DEBITADO\s+DE):?$'
-            for idx_p, linha_p in enumerate(linhas):
-                if re.search(rotulo_pagador_regex, linha_p.strip(), re.IGNORECASE):
-                    for offset in [1, 2, 3]:
-                        if idx_p + offset < len(linhas):
-                            cand_pl = linhas[idx_p + offset].strip()
-                            cand_pl_upper = cand_pl.upper()
-                            if cand_pl_upper.startswith("NOME:"):
-                                cand_pl = cand_pl[5:].strip()
-                            elif re.match(r'^(PAGADOR|TITULAR):\s*', cand_pl, re.IGNORECASE):
-                                cand_pl = re.sub(r'^(PAGADOR|TITULAR):\s*', '', cand_pl, flags=re.IGNORECASE).strip()
-                            if len(cand_pl) >= 3 and not any(k in cand_pl.upper() for k in termos_invalidos):
-                                if not re.match(r'^(CPF|CNPJ|CHAVE|BANCO|INSTITUI|AG[EÊ]NCIA|CONTA|DATA|VALOR)', cand_pl_upper):
-                                    if cand_pl.upper() != (recebedor_pix or "").upper():
-                                        pagador_pix = cand_pl
-                                        break
-                    if pagador_pix:
-                        break
-
-        # Documentos do Recebedor e Pagador (CPF/CNPJ)
-        docs_encontrados = re.findall(r'(\*{2,3}\.?\d{3}\.?\d{3}\-?\*{2}|\d{3}\.?\*{3}\.?\*{3}\-?\d{2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2})', texto_bruto)
-        if docs_encontrados:
-            doc_recebedor = docs_encontrados[0]
-            if len(docs_encontrados) > 1:
-                doc_pagador = docs_encontrados[1]
-
-        # Tenta localizar documento explicitamente vinculado ao pagador
-        m_doc_pag = re.search(r'(?:PAGADOR|ORIGEM|DEBITADO\s+DE|QUEM\s+PAGOU|PAGO\s+POR|DADOS\s+DO\s+PAGADOR|DE:)[\s\S]{1,120}?(?:CPF|CNPJ)?[\s:]*(\*{2,3}\.?\d{3}\.?\d{3}\-?\*{2}|\d{3}\.?\*{3}\.?\*{3}\-?\d{2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2})', texto_bruto, re.IGNORECASE)
-        if m_doc_pag:
-            doc_pagador = m_doc_pag.group(1).strip()
-
-    # 1b. Atribuição do Estabelecimento / Recebedor Final
-    if recebedor_pix:
-        estabelecimento = recebedor_pix
-        if doc_recebedor and doc_recebedor not in estabelecimento:
-            estabelecimento = f"{estabelecimento} ({doc_recebedor})"
-    else:
-        estabelecimento = linhas[0] if linhas else "Desconhecido"
-        # CNPJ para notas fiscais tradicionais
-        cnpj_match = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', texto_bruto)
-        cnpj = cnpj_match.group(0) if cnpj_match else ""
-        if cnpj and "CNPJ:" not in estabelecimento:
-            estabelecimento = f"{estabelecimento} (CNPJ: {cnpj})"
-    
-    # 2. Data e Hora Reais do Documento (Extração inteligente resiliente a múltiplos formatos)
-    data_str, hora_str = extrair_data_e_hora_documento(texto_bruto)
-    
-    # 3. Valor Total
-    valor_match = re.search(r'(?:TOTAL|VALOR A PAGAR|PAGAR|VALOR PAGO|VALOR DA TRANSFER[EÊ]NCIA|VALOR|R\$\s*)[\s:]*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
-    if not valor_match:
-        valores = re.findall(r'(\d+[\.,]\d{2})', texto_bruto)
-        valor = float(valores[-1].replace(',', '.')) if valores else 0.0
-    else:
-        try:
-            valor = float(valor_match.group(1).replace(',', '.'))
-        except ValueError:
-            valor = 0.0
-
-    # 3b. Valor de Desconto
-    desconto_match = re.search(r'(?:DESCONTO|DESC|ABATIMENTO)[\s:]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
-    desconto_val = float(desconto_match.group(1).replace(',', '.')) if desconto_match else 0.0
-
-    # 3c. Valor de Troco
-    troco_match = re.search(r'(?:TROCO)[\s:]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
-    troco_val = float(troco_match.group(1).replace(',', '.')) if troco_match else 0.0
-
-    # 3d. Impostos / Tributos Aproximados
-    trib_match = re.search(r'(?:TRIB|TRIBUTOS|IMPOSTO|IBPT)[\s\w]*R?\$?\s*(\d+[\.,]\d{2})', texto_bruto, re.IGNORECASE)
-    trib_val = float(trib_match.group(1).replace(',', '.')) if trib_match else 0.0
-
-    # 5. Forma de Pagamento & Bandeira do Cartão
-    if is_pix:
-        pagamento = "Pix"
-    elif "CREDITO" in texto_upper or "CRÉDITO" in texto_upper:
-        pagamento = "Cartão de Crédito"
-    elif "DEBITO" in texto_upper or "DÉBITO" in texto_upper:
-        pagamento = "Cartão de Débito"
-    elif "DINHEIRO" in texto_upper:
-        pagamento = "Dinheiro"
-    else:
-        pagamento = "Não Informado"
-
-    bandeira_str = "Não Informada"
-    if "VISA" in texto_upper:
-        bandeira_str = "Visa"
-    elif "MASTERCARD" in texto_upper or "MASTER" in texto_upper:
-        bandeira_str = "Mastercard"
-    elif "ELO" in texto_upper:
-        bandeira_str = "Elo"
-    elif "AMEX" in texto_upper or "AMERICAN" in texto_upper:
-        bandeira_str = "Amex"
-    elif "HIPERCARD" in texto_upper or "HIPER" in texto_upper:
-        bandeira_str = "Hipercard"
-
-    # 6. Tipo de Documento
-    if is_pix:
-        tipo_doc = "Comprovante Pix"
-    elif is_pdf:
-        tipo_doc = "Nota Fiscal (PDF)"
-    elif "NFC-E" in texto_upper or "NOTA FISCAL" in texto_upper or "DANFE" in texto_upper:
-        tipo_doc = "Nota Fiscal Eletrônica (DANFE)"
-    elif "RECIBO" in texto_upper:
-        tipo_doc = "Recibo"
-    else:
-        tipo_doc = "Cupom Fiscal"
+            ultimo_erro = "Timeout na API Gemini (>30s)"
+            rotate_gemini_key()
+        except Exception as e_gem:
+            logger.error(f"Exceção ao chamar Gemini: {e_gem}")
+            ultimo_erro = str(e_gem)
+            rotate_gemini_key()
 
     return {
-        "status_leitura": "sucesso",
-        "mensagem_erro": None,
-        "data": data_str,
-        "hora": hora_str,
-        "estabelecimento": estabelecimento,
-        "tipo_documento": tipo_doc,
-        "categoria": "Geral",
-        "pagamento": pagamento,
-        "bandeira": bandeira_str,
-        "valor": valor,
-        "desconto": desconto_val,
-        "troco": troco_val,
-        "tributos": trib_val,
-        "pagador": pagador_pix if pagador_pix else None,
-        "doc_pagador": doc_pagador if doc_pagador else None,
-        "recebedor": recebedor_pix if recebedor_pix else None,
-        "doc_recebedor": doc_recebedor if doc_recebedor else None,
-        "itens": extrair_itens_documento(texto_bruto)
+        "status_leitura": "ilegivel",
+        "mensagem_erro": f"Não foi possível processar o comprovante com o Gemini: {ultimo_erro or 'Falha de comunicação'}"
     }
 
 def verificar_duplicidade(dados_extraidos: dict, limite_registros: int = 50) -> bool:
@@ -1346,10 +1269,10 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
 
     try:
         # 1. Envia aviso inicial amigável ao usuário
-        msg_inicial = "🔍 Processando nota fiscal (PDF) com IA..." if is_pdf else "🔍 Processando comprovante fiscal com IA (Hugging Face)..."
+        msg_inicial = "🔍 Processando nota fiscal (PDF) com IA Gemini 3.8 Flash..." if is_pdf else "🔍 Processando comprovante com IA Gemini 3.8 Flash..."
         send_telegram_message(chat_id, msg_inicial, message_id)
 
-        # 2. Download da imagem do Telegram e Análise com Hugging Face (com cronometragem)
+        # 2. Download da imagem do Telegram e Análise com Google Gemini 3.8 Flash (com cronometragem)
         try:
             t_dl_start = time.time()
             img_bytes, url_direta_imagem = download_telegram_file(file_id)
@@ -1370,7 +1293,6 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
                 log_entry["metricas_tempo"] = {
                     "download_sec": round(t_download, 2),
                     "gemini_sec": round(t_gemini, 2),
-                    "hf_sec": round(t_gemini, 2),
                     "duplicidade_sec": 0.0,
                     "sheets_write_sec": 0.0,
                     "total_sec": round(t_total, 2)
@@ -1392,22 +1314,14 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
             log_entry["itens"] = extracted_data.get("itens", [])
             log_entry["detalhes"] = json.dumps(extracted_data, ensure_ascii=False)
 
-        except Exception as e_hf:
+        except Exception as e_gemini:
             t_total = time.time() - t_start
-            err_str = str(e_hf)
+            err_str = str(e_gemini)
             log_entry["tempo_total_sec"] = round(t_total, 2)
             log_entry["status_gemini"] = "Falha"
-            log_entry["status_sheets"] = "Cancelado (Erro Hugging Face)"
-            log_entry["erro"] = f"Erro na Hugging Face IA: {err_str}"
-
-            if "503" in err_str or "aquecendo" in err_str.lower():
-                friendly_error = (
-                    "⏳ *Modelo de IA da Hugging Face Aquecendo*\n\n"
-                    "O modelo de visão computacional (Florence-2) está carregando na memória na Hugging Face (Status 503).\n"
-                    "Por favor, aguarde 15 a 30 segundos e **envie a foto novamente**."
-                )
-            else:
-                friendly_error = f"⚠️ Não foi possível analisar o comprovante: {err_str}"
+            log_entry["status_sheets"] = "Cancelado (Erro Gemini)"
+            log_entry["erro"] = f"Erro no Gemini 3.8 Flash: {err_str}"
+            friendly_error = f"⚠️ Não foi possível analisar o comprovante com o Gemini: {err_str}"
 
             send_telegram_message(chat_id, friendly_error, message_id)
             return
@@ -1480,7 +1394,6 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
                 log_entry["metricas_tempo"] = {
                     "download_sec": round(t_download, 2),
                     "gemini_sec": round(t_gemini, 2),
-                    "hf_sec": round(t_gemini, 2),
                     "duplicidade_sec": round(t_duplicidade, 2),
                     "sheets_write_sec": round(t_sheets_write, 2),
                     "total_sec": round(t_total, 2)
@@ -1489,7 +1402,7 @@ def process_receipt_photo_task(chat_id: int, message_id: int, chat_user: str, fi
                 logger.info(
                     f"⏱️ MEDIÇÃO DE PERFORMANCE (Log #{log_entry['id']}):\n"
                     f"  • Download Telegram: {t_download:.2f}s\n"
-                    f"  • Análise Hugging Face IA: {t_gemini:.2f}s\n"
+                    f"  • Análise Gemini 3.8 Flash: {t_gemini:.2f}s\n"
                     f"  • Checagem Duplicidade: {t_duplicidade:.2f}s\n"
                     f"  • Gravação no Sheets: {t_sheets_write:.2f}s\n"
                     f"  • Tempo Total: {t_total:.2f}s"
@@ -1687,11 +1600,10 @@ def get_logs_json():
         "total_logs": len(processing_logs),
         "spreadsheet_id_configured": bool(SPREADSHEET_ID),
         "credentials_configured": bool(GOOGLE_CREDENTIALS_JSON),
-        "hf_configured": bool(HF_API_TOKEN),
-        "hf_model_url": HF_MODEL_URL,
-        "gemini_configured": bool(HF_API_TOKEN or GEMINI_KEYS),
-        "gemini_keys_count": 1 if HF_API_TOKEN else len(GEMINI_KEYS),
-        "active_key_index": 0,
+        "ai_engine": "Google Gemini 3.8 Flash (Multimodal)",
+        "gemini_configured": bool(GEMINI_KEYS),
+        "gemini_keys_count": len(GEMINI_KEYS),
+        "active_key_index": current_key_index % len(GEMINI_KEYS) if GEMINI_KEYS else 0,
         "logs": processing_logs
     }
 
@@ -1747,7 +1659,7 @@ def dashboard_logs_page(request: Request):
 
     # Status de configurações
     sheets_ok = bool(SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON)
-    gemini_ok = bool(HF_API_TOKEN or GEMINI_KEYS)
+    gemini_ok = bool(GEMINI_KEYS)
     telegram_ok = bool(TELEGRAM_BOT_TOKEN)
 
     sheet_id_display = "Não configurada"
@@ -2282,7 +2194,7 @@ def dashboard_logs_page(request: Request):
                         <span class="dot"></span> Sheets %SHEETS_OK_TEXT%
                     </div>
                     <div class="indicator %GEMINI_OK_CLASS%">
-                        <span class="dot"></span> Hugging Face IA %GEMINI_OK_TEXT%
+                        <span class="dot"></span> Gemini IA %GEMINI_OK_TEXT%
                     </div>
                     <div class="indicator %TELEGRAM_OK_CLASS%">
                         <span class="dot"></span> Telegram %TELEGRAM_OK_TEXT%
@@ -2421,7 +2333,7 @@ def dashboard_logs_page(request: Request):
             <div class="modal-header">
                 <div>
                     <h2 id="modalTitle">Detalhes do Comprovante Fiscal</h2>
-                    <p class="text-muted" style="font-size: 12px; margin-top: 2px;" id="modalSubtitle">Lançamento processado pela IA Hugging Face (Florence-2)</p>
+                    <p class="text-muted" style="font-size: 12px; margin-top: 2px;" id="modalSubtitle">Lançamento processado pela IA Google Gemini 3.8 Flash</p>
                 </div>
                 <button class="modal-close" onclick="closeModal()">✕</button>
             </div>
@@ -2902,11 +2814,11 @@ def system_logs_page(request: Request):
     falhas_count = sum(1 for log in processing_logs if log.get("erro") or "Falha" in str(log.get("status_sheets")) or "Falha" in str(log.get("status_gemini")))
 
     sheets_ok = bool(SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON)
-    gemini_ok = bool(HF_API_TOKEN or GEMINI_KEYS)
+    gemini_ok = bool(GEMINI_KEYS)
     telegram_ok = bool(TELEGRAM_BOT_TOKEN)
 
-    active_key_idx = 1 if HF_API_TOKEN else (current_key_index % len(GEMINI_KEYS) + 1 if GEMINI_KEYS else 0)
-    hf_keys_count = 1 if HF_API_TOKEN else len(GEMINI_KEYS)
+    active_key_idx = (current_key_index % len(GEMINI_KEYS) + 1) if GEMINI_KEYS else 0
+    hf_keys_count = len(GEMINI_KEYS)
     raw_logs_json = json.dumps(processing_logs, ensure_ascii=False)
 
     template = """<!DOCTYPE html>
@@ -3277,7 +3189,7 @@ def system_logs_page(request: Request):
                 <div class="brand-icon">📜</div>
                 <div class="title-group">
                     <h1>Central de Logs & Telemetria do Sistema</h1>
-                    <p>Auditoria de Execuções, Erros, Chamadas Hugging Face e Webhooks</p>
+                    <p>Auditoria de Execuções, Erros, Chamadas Gemini 3.8 Flash e Webhooks</p>
                 </div>
             </div>
 
@@ -3287,7 +3199,7 @@ def system_logs_page(request: Request):
                         <span class="dot"></span> Sheets %SHEETS_OK_TEXT%
                     </div>
                     <div class="indicator %GEMINI_OK_CLASS%">
-                        <span class="dot"></span> Hugging Face IA %GEMINI_OK_TEXT%
+                        <span class="dot"></span> Gemini IA %GEMINI_OK_TEXT%
                     </div>
                     <div class="indicator %TELEGRAM_OK_CLASS%">
                         <span class="dot"></span> Telegram %TELEGRAM_OK_TEXT%
@@ -3324,9 +3236,9 @@ def system_logs_page(request: Request):
                 <div class="subtext">Imagens ilegíveis ou erros de API</div>
             </div>
             <div class="kpi-card">
-                <div class="label">Status API Hugging Face</div>
-                <div class="value font-mono" style="font-size: 16px; margin-top: 6px;">%HF_STATUS_TEXT%</div>
-                <div class="subtext">Modelo Florence-2 Inference API</div>
+                <div class="label">Motor de IA Multimodal</div>
+                <div class="value font-mono" style="font-size: 16px; margin-top: 6px;">Gemini 3.8 Flash</div>
+                <div class="subtext">Nativo · Mínimo de Tokens</div>
             </div>
         </div>
 
@@ -3339,7 +3251,7 @@ def system_logs_page(request: Request):
 
             <div class="filter-selects">
                 <select id="statusGeminiSelect" class="select-field" onchange="onFilterChange()">
-                    <option value="">Status IA / HF (Todos)</option>
+                    <option value="">Status IA Gemini (Todos)</option>
                     <option value="Sucesso">Sucesso</option>
                     <option value="Processando">Processando</option>
                     <option value="Ilegível">Ilegível</option>
@@ -3373,7 +3285,7 @@ def system_logs_page(request: Request):
                             <th>Data / Hora</th>
                             <th>ID do Evento</th>
                             <th>Origem / Usuário</th>
-                            <th>Status Hugging Face</th>
+                            <th>Status Gemini IA</th>
                             <th>Status Planilha</th>
                             <th>Estabelecimento / Erro</th>
                             <th class="text-center">Ações</th>
@@ -3579,7 +3491,7 @@ def system_logs_page(request: Request):
                     <div style="font-weight:700; margin-bottom:6px; color:var(--info);">⚡ MÉTRICAS DE DESEMPENHO E LATÊNCIA</div>
                     <div style="display:flex; gap:12px; flex-wrap:wrap;">
                         <div><b>📥 Download Telegram:</b> ${log.metricas_tempo.download_sec}s</div>
-                        <div><b>🧠 Análise Hugging Face IA:</b> ${(log.metricas_tempo.hf_sec || log.metricas_tempo.gemini_sec || 0)}s</div>
+                        <div><b>🧠 Análise Gemini 3.8 Flash:</b> ${(log.metricas_tempo.gemini_sec || 0)}s</div>
                         <div><b>🔍 Checagem Duplicidade:</b> ${log.metricas_tempo.duplicidade_sec}s</div>
                         <div><b>✍️ Escrita Sheets:</b> ${log.metricas_tempo.sheets_write_sec}s</div>
                         <div><b>⏱️ Tempo Total:</b> <span style="color:var(--primary); font-weight:800;">${log.metricas_tempo.total_sec}s</span></div>
@@ -3632,7 +3544,7 @@ def system_logs_page(request: Request):
         .replace("%SUCESSOS_SHEETS%", str(sucessos_sheets))
         .replace("%FALHAS_LOGS%", str(falhas_count))
         .replace("%FALHAS_COLOR%", 'var(--danger)' if falhas_count > 0 else 'var(--text-main)')
-        .replace("%HF_STATUS_TEXT%", 'Florence-2 (Ativo)' if gemini_ok else 'HF Token Ausente')
+        .replace("%HF_STATUS_TEXT%", 'Gemini 3.8 Flash (Ativo)' if gemini_ok else 'Chave Ausente')
         .replace("%ACTIVE_KEY_INDEX%", str(active_key_idx))
         .replace("%GEMINI_KEYS_COUNT%", str(hf_keys_count))
         .replace("%RAW_LOGS_JSON%", raw_logs_json)
