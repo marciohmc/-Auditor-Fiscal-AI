@@ -215,24 +215,31 @@ export const DocumentModal: React.FC<DocumentModalProps> = ({
             </div>
           </div>
 
-          {/* Detailed items list if available */}
-          {entry.itens && entry.itens.length > 0 && (
-            <div className="border border-slate-200 rounded-xl p-3.5 bg-slate-50/70 space-y-2">
-              <div className="flex items-center justify-between">
-                <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
-                  <ShoppingBag className="w-3.5 h-3.5 text-emerald-600" />
-                  <span>DADOS DO PRODUTO / SERVIÇOS — Itens Comprados / Discriminados na Nota ({entry.itens.length})</span>
-                </h4>
+          {/* Detailed items list - DADOS DO PRODUTO / SERVIÇOS */}
+          <div className="border border-slate-200 rounded-xl p-3.5 bg-slate-50/80 space-y-2.5">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-200 pb-2">
+              <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                <ShoppingBag className="w-4 h-4 text-emerald-600" />
+                <span>DADOS DO PRODUTO / SERVIÇOS — Itens Comprados / Discriminados na Nota</span>
+              </h4>
+              <div className="flex items-center gap-1.5 text-[11px]">
+                <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-medium border border-emerald-200 flex items-center gap-1">
+                  <span>Aba Planilha:</span>
+                  <span className="font-mono font-bold">Produtos_{(entry.data || '').split('/')[1] || '11'}_{ (entry.data || '').split('/')[2] || '2026'}</span>
+                </span>
               </div>
-              <div className="overflow-x-auto max-h-[180px] overflow-y-auto border border-slate-200 rounded-lg bg-white">
+            </div>
+
+            {entry.itens && entry.itens.length > 0 ? (
+              <div className="overflow-x-auto max-h-[220px] overflow-y-auto border border-slate-200 rounded-lg bg-white shadow-2xs">
                 <table className="w-full text-left text-[11px]">
-                  <thead className="bg-slate-100 text-slate-600 font-semibold sticky top-0 border-b border-slate-200">
+                  <thead className="bg-slate-100 text-slate-700 font-semibold sticky top-0 border-b border-slate-200">
                     <tr>
-                      <th className="py-2 px-2.5 w-8">#</th>
+                      <th className="py-2 px-2.5 w-8 text-center">#</th>
                       <th className="py-2 px-2.5">Descrição do Produto / Serviço</th>
-                      <th className="py-2 px-2.5 text-center w-12">Qtd</th>
+                      <th className="py-2 px-2.5 text-center w-14">Qtd</th>
                       <th className="py-2 px-2.5 text-right w-24">Vlr Unit. (R$)</th>
-                      <th className="py-2 px-2.5 text-right w-24">Vlr Total (R$)</th>
+                      <th className="py-2 px-2.5 text-right w-28">Vlr Total (R$)</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 font-sans">
@@ -240,7 +247,7 @@ export const DocumentModal: React.FC<DocumentModalProps> = ({
                       const vUnit = item.valor_unitario ?? (item.valor_total / (item.quantidade || 1));
                       return (
                         <tr key={idx} className="hover:bg-slate-50 transition-colors">
-                          <td className="py-2 px-2.5 font-mono text-slate-400">{idx + 1}</td>
+                          <td className="py-2 px-2.5 font-mono text-slate-400 text-center">{idx + 1}</td>
                           <td className="py-2 px-2.5 font-semibold text-slate-900">{item.descricao}</td>
                           <td className="py-2 px-2.5 text-center font-mono text-slate-600">{item.quantidade}</td>
                           <td className="py-2 px-2.5 text-right font-mono text-slate-600">
@@ -253,10 +260,25 @@ export const DocumentModal: React.FC<DocumentModalProps> = ({
                       );
                     })}
                   </tbody>
+                  <tfoot className="bg-slate-50 font-bold border-t border-slate-200">
+                    <tr>
+                      <td colSpan={4} className="py-2 px-2.5 text-right text-slate-700">Total dos Itens:</td>
+                      <td className="py-2 px-2.5 text-right font-mono text-emerald-700">
+                        R$ {entry.itens.reduce((acc, i) => acc + (i.valor_total || 0), 0).toFixed(2)}
+                      </td>
+                    </tr>
+                  </tfoot>
                 </table>
               </div>
-            </div>
-          )}
+            ) : (
+              <div className="p-4 bg-white border border-dashed border-slate-300 rounded-lg text-center space-y-1">
+                <p className="text-slate-600 font-medium text-xs">Nenhum item individual discriminado no documento original.</p>
+                <p className="text-[11px] text-slate-400">
+                  Os valores consolidados da Nota Fiscal foram registrados na aba principal de extrato, com resumo vinculado à aba mensal de produtos.
+                </p>
+              </div>
+            )}
+          </div>
 
           {/* Audit Notes Input */}
           <div className="space-y-1.5">

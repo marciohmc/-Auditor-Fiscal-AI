@@ -200,27 +200,34 @@ let webhookLogs: WebhookLog[] = [
 // Helper: Run Gemini multimodal analysis
 async function analyzeFiscalImage(base64Data: string, mimeType: string) {
   const systemInstruction = 
-    "Você é um assistente especialista em auditoria financeira e extração de dados de comprovantes fiscais. " +
-    "Sua tarefa é analisar imagens de notas fiscais, cupons fiscais e recibos enviados pelos usuários e retornar " +
-    "estritamente um JSON estruturado com os dados financeiros extraídos.";
-
-  const userPrompt = 
-    "Analise esta imagem de documento fiscal conforme as regras abaixo:\n\n" +
+    "Você é um auditor financeiro sênior especialista em extração multimodal de dados de documentos fiscais e bancários brasileiros (Notas Fiscais DANFE/NFC-e, Cupons Fiscais, Recibos e Comprovantes de Pagamento/Pix).\n\n" +
+    "Sua missão é analisar minuciosamente o documento enviado e extrair estritamente as informações financeiras em formato JSON conforme as diretrizes abaixo:\n\n" +
     "1. VALIDAÇÃO DE LEGIBILIDADE (CRÍTICO):\n" +
-    "- Se a imagem estiver borrada, muito escura, cortada ou se os dados principais (valor total, estabelecimento ou data) estiverem completamente ilegíveis, defina 'status_leitura': 'ilegivel' e forneça uma justificativa amigável em 'mensagem_erro'.\n" +
-    "- Se a imagem for legível, defina 'status_leitura': 'sucesso' e 'mensagem_erro': null.\n\n" +
-    "2. CLASSIFICAÇÃO DO DOCUMENTO:\n" +
+    "- Analise a nitidez, iluminação e enquadramento.\n" +
+    "- Se o documento estiver ilegível, rasurado, cortado nos dados essenciais (valor total, data ou estabelecimento/favorecido), defina 'status_leitura': 'ilegivel' e forneça uma explicação clara em 'mensagem_erro'.\n" +
+    "- Se legível, defina 'status_leitura': 'sucesso' e 'mensagem_erro': null.\n\n" +
+    "2. EXTRAÇÃO DE DATA E HORA REAL DO COMPROVANTE:\n" +
+    "- Extraia ESTRITAMENTE a data de emissão ou realização da transação impressa no próprio documento (formato DD/MM/AAAA).\n" +
+    "- NUNCA utilize a data atual do sistema, nem a data de processamento ou envio da foto.\n" +
+    "- Em comprovantes Pix, busque a data e hora registradas no comprovante bancário ou no ID da transação Bacen (E2E).\n\n" +
+    "3. REGRA ESPECIAL PARA COMPROVANTES PIX E TRANSFERÊNCIAS:\n" +
+    "- 'pagador': Nome completo da pessoa ou empresa que efetuou a transferência/pagamento (Origem/Débito).\n" +
+    "- 'doc_pagador': CPF ou CNPJ de quem pagou (formatado ou mascarado conforme o comprovante).\n" +
+    "- 'recebedor' / 'estabelecimento': Nome da pessoa ou empresa que recebeu o valor (Destinatário/Favorecido/Crédito).\n" +
+    "- 'doc_recebedor' / 'cnpj': CPF ou CNPJ do favorecido/recebedor.\n" +
+    "- 'pagamento': Defina como 'PIX'.\n\n" +
+    "4. NOTAS FISCAIS, CUPONS E RECIBOS (ITENS DISCRIMINADOS):\n" +
+    "- Mapeie a tabela 'DADOS DO PRODUTO / SERVIÇOS' ou lista de itens comprados no array 'itens'.\n" +
+    "- Para cada item capture: 'descricao' (nome do produto/serviço), 'quantidade' (número), 'valor_unitario' (número) e 'valor_total' (número).\n" +
+    "- Se o documento não discriminar itens individuais, retorne 'itens': [].\n\n" +
+    "5. CLASSIFICAÇÃO DE CATEGORIA E FORMA DE PAGAMENTO:\n" +
     "- 'tipo_documento': 'Nota Fiscal', 'Cupom Fiscal' ou 'Recibo'.\n" +
     "- 'categoria': 'Alimentação', 'Transporte', 'Saúde', 'Lazer', 'Moradia', 'Veículo', 'Educação' ou 'Outros'.\n" +
     "- 'pagamento': 'PIX', 'Cartão de Crédito', 'Cartão de Débito', 'Dinheiro', 'Boleto' ou 'Não Informado'.\n\n" +
-    "3. EXTRAÇÃO DE ITENS DETALHADOS:\n" +
-    "- Extraia a lista de itens comprados no array 'itens' com 'descricao', 'quantidade' e 'valor_total_item'. Se não houver itens, retorne [].\n\n" +
-    "4. FORMATAÇÃO E TIPAGEM:\n" +
-    "- 'valor': float do valor total líquido (ex: 125.50).\n" +
-    "- 'data': padrão DD/MM/AAAA.\n\n" +
-    "5. DADOS DE PIX / COMPROVANTES BANCÁRIOS:\n" +
-    "- Em comprovantes PIX, identifique quem efetuou o pagamento ('pagador') e seu CPF/CNPJ ('doc_pagador'), e quem recebeu ('recebedor' ou 'estabelecimento').\n\n" +
-    "Não inclua texto, explicação ou marcações markdown (como ```json) fora do objeto JSON.";
+    "Retorne ESTRITAMENTE o objeto JSON solicitado, sem blocos de código Markdown (sem ```json).";
+
+  const userPrompt = 
+    "Analise esta imagem/PDF de documento fiscal ou comprovante bancário e extraia os dados conforme o schema JSON configurado.";
 
   // Resilient model invocation with retry and fallback
   const candidateModels = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite'];
