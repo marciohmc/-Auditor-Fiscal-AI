@@ -20,6 +20,7 @@ from config import (
     SPREADSHEET_ID,
     GOOGLE_CREDENTIALS_JSON,
     GEMINI_KEYS,
+    OCR_SPACE_API_KEY,
     PORT,
     PASSCM,
     logger
@@ -326,6 +327,7 @@ def health():
             "webhook_url": TELEGRAM_WEBHOOK_URL,
             "google_sheets_presente": bool(GOOGLE_CREDENTIALS_JSON and SPREADSHEET_ID),
             "spreadsheet_id": SPREADSHEET_ID[:8] + "..." if SPREADSHEET_ID else None,
+            "ocr_space_ativo": bool(OCR_SPACE_API_KEY),
             "gemini_keys_count": len(GEMINI_KEYS)
         }
     }
@@ -361,6 +363,7 @@ def index_page():
             <p>Servidor FastAPI ativo com suporte a Telegram Webhook, Gemini AI e Google Sheets.</p>
             <div class="item"><span>Telegram Bot:</span> <b>{'Configurado' if TELEGRAM_BOT_TOKEN else 'Pendente'}</b></div>
             <div class="item"><span>Google Sheets:</span> <b>{'Conectado' if (SPREADSHEET_ID and GOOGLE_CREDENTIALS_JSON) else 'Pendente'}</b></div>
+            <div class="item"><span>Motor OCR.space API:</span> <b>Ativo (OCREngine 2 + isTable=true)</b></div>
             <div class="item"><span>Chaves Gemini Ativas:</span> <b>{len(GEMINI_KEYS)} chave(s)</b></div>
             <div class="item"><span>Endpoint Webhook:</span> <code>/webhook</code></div>
             <a href="/setup-webhook" class="btn">⚡ Configurar Webhook no Telegram</a>

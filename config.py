@@ -23,6 +23,11 @@ TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEG
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
 
+# Variável do OCR.space API (https://ocr.space/ocrapi)
+# Caso não configurada no ambiente, usa a chave gratuita padrão 'helloworld'
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld").strip() or "helloworld"
+OCR_SPACE_API_URL = "https://api.ocr.space/parse/image"
+
 # Chaves Gemini (Principal e Reserva para Failover / Erro 429)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_API_KEY_1 = os.getenv("GEMINI_API_KEY_1", "").strip()
