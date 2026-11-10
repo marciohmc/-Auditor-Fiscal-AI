@@ -1,9 +1,10 @@
 import os
 import logging
-from dotenv import load_dotenv
-
-# Carrega variáveis de ambiente de arquivo .env se existir
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Configuração estruturada de Logs
 logging.basicConfig(
