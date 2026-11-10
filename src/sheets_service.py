@@ -117,9 +117,12 @@ def registrar_transacao_planilha(dados: dict, responsavel: str = "Telegram", rec
     pagamento = dados.get("pagamento") or "Não Informado"
     valor_float = float(dados.get("valor") or 0.0)
 
+    # Limpeza de caracteres de escape (ex: file\_160.pdf -> file_160.pdf) e formatação do HYPERLINK no padrão Brasil (;)
     if receipt_link:
-        link_formula = f'=HYPERLINK("{receipt_link}", "Ver Comprovante")'
+        clean_link = receipt_link.replace("\\_", "_").replace("\\", "").strip()
+        link_formula = f'=HYPERLINK("{clean_link}"; "Ver Comprovante")'
     else:
+        clean_link = ""
         link_formula = ""
 
     linha = [

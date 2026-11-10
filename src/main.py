@@ -70,7 +70,8 @@ def download_telegram_file(file_id: str) -> tuple[bytes, str]:
     file_path = res.get("result", {}).get("file_path", "")
     if not file_path:
         raise ValueError(f"Não foi possível localizar o arquivo no Telegram para o ID: {file_id}")
-    download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    clean_file_path = file_path.replace("\\_", "_").replace("\\", "").strip()
+    download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{clean_file_path}"
     file_res = requests.get(download_url, timeout=30)
     return file_res.content, download_url
 
